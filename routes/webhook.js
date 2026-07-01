@@ -8,6 +8,8 @@ const findMedicineDoc = require('../services/medicineService');
 const { sendWhatsAppMessage, sendInteractiveButtons, sendInteractiveList, downloadWhatsAppImage } = require('../services/whatsapp');
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "my_super_secret_token_123";
+// رقم واتساب الصيدلي المسؤول عن مراجعة طلبات الروشتات قبل التأكيد النهائي (خطوة "Pharmacist confirmation" في الفلو)
+const PHARMACIST_PHONE_NUMBER = process.env.PHARMACIST_PHONE_NUMBER || null;
 
 router.get('/webhook', (req, res) => {
     let mode = req.query['hub.mode'];
@@ -273,6 +275,102 @@ router.post('/webhook', async (req, res) => {
                 else if (actionId === 'FLOW_PHARMACY') {
                     await sendWhatsAppMessage(from, "مرحباً بك في الصيدلية 💊. أرسل اسم الدواء الذي تبحث عنه أو قم بتصوير الروشتة وسأقوم بفحصها فوراً.");
                 }
+
+                // ==========================================
+                // 🆕 المريض دوس "احجز الأدوية" بعد فحص الروشتة
+                // بنحول الطلب لحالة "مراجعة الصيدلي" ونبعتله رسالة فيها زرارين تأكيد/رفض (خطوة Pharmacist confirmation في الفلو)
+                // ==========================================
+                else if (actionId.startsWith('BOOK_ORDER_')) {
+                    const orderId = actionId.replace('BOOK_ORDER_', '');
+                    const orderRef = db.collection('prescription_orders').doc(orderId);
+                    const orderSnap = await orderRef.get();
+
+                    if (!orderSnap.exists || orderSnap.data().status !== 'draft') {
+                        await sendWhatsAppMessage(from, "❌ عذراً، هذا الطلب لم يعد متاحاً (ربما تم التعامل معه بالفعل).");
+                        return res.sendStatus(200);
+                    }
+
+                    const order = orderSnap.data();
+                    await orderRef.update({ status: 'pending_pharmacist_review', requested_at: new Date() });
+
+                    await sendWhatsAppMessage(from, "⏳ تم إرسال طلبك للصيدلي للمراجعة والتأكيد، هنبلغك فور الرد.");
+
+                    if (PHARMACIST_PHONE_NUMBER) {
+                        let itemsList = order.items.map(it => `- ${it.id.toUpperCase()} (${it.price})`).join('\n');
+                        await sendInteractiveButtons(
+                            PHARMACIST_PHONE_NUMBER,
+                            `📋 طلب روشتة جديد يحتاج مراجعتك\nمن المريض: ${from}\n\nالأدوية:\n${itemsList}`,
+                            [
+                                { id: `CONFIRM_ORDER_${orderId}`, title: "✅ تأكيد الطلب" },
+                                { id: `REJECT_ORDER_${orderId}`, title: "❌ رفض الطلب" }
+                            ]
+                        );
+                    } else {
+                        console.warn("⚠️ PHARMACIST_PHONE_NUMBER غير مُعرّف في .env — لن يتم إرسال الطلب لأي صيدلي للمراجعة.");
+                    }
+                }
+
+                // المريض دوس "لا شكراً" بعد فحص الروشتة
+                else if (actionId.startsWith('CANCEL_ORDER_')) {
+                    const orderId = actionId.replace('CANCEL_ORDER_', '');
+                    await db.collection('prescription_orders').doc(orderId).update({ status: 'cancelled_by_patient' });
+                    await sendWhatsAppMessage(from, "تم الإلغاء. لو احتجت أي حاجة تانية أنا موجود 🙌");
+                }
+
+                // ==========================================
+                // 🆕 الصيدلي (من رقمه المسجل في PHARMACIST_PHONE_NUMBER بس) بيدوس تأكيد/رفض على الطلب
+                // ==========================================
+                else if (actionId.startsWith('CONFIRM_ORDER_')) {
+                    if (!PHARMACIST_PHONE_NUMBER || from !== PHARMACIST_PHONE_NUMBER) {
+                        await sendWhatsAppMessage(from, "❌ عذراً، هذا الإجراء متاح فقط لصيدلي المستشفى المسجل.");
+                        return res.sendStatus(200);
+                    }
+
+                    const orderId = actionId.replace('CONFIRM_ORDER_', '');
+                    const orderRef = db.collection('prescription_orders').doc(orderId);
+                    const orderSnap = await orderRef.get();
+
+                    if (!orderSnap.exists || orderSnap.data().status !== 'pending_pharmacist_review') {
+                        await sendWhatsAppMessage(from, "⚠️ هذا الطلب تمت معالجته بالفعل أو غير موجود.");
+                        return res.sendStatus(200);
+                    }
+
+                    const order = orderSnap.data();
+
+                    // بننزل المخزون فعلياً بس دلوقتي (بعد تأكيد بشري)، مش وقت الحجز الأولي من المريض
+                    for (const item of order.items) {
+                        const medRef = db.collection('medicines').doc(item.id);
+                        const medSnap = await medRef.get();
+                        if (medSnap.exists && medSnap.data().stock > 0) {
+                            await medRef.update({ stock: medSnap.data().stock - 1 });
+                        }
+                    }
+
+                    await orderRef.update({ status: 'confirmed', confirmed_at: new Date() });
+                    await sendWhatsAppMessage(from, "✅ تم تأكيد الطلب بنجاح.");
+                    await sendWhatsAppMessage(order.patient_phone, "✅ تم تأكيد طلبك من الصيدلي! تقدر تستلم أدويتك من مقر الصيدلية دلوقتي. نتمنى لك دوام الصحة 🌿");
+                }
+
+                else if (actionId.startsWith('REJECT_ORDER_')) {
+                    if (!PHARMACIST_PHONE_NUMBER || from !== PHARMACIST_PHONE_NUMBER) {
+                        await sendWhatsAppMessage(from, "❌ عذراً، هذا الإجراء متاح فقط لصيدلي المستشفى المسجل.");
+                        return res.sendStatus(200);
+                    }
+
+                    const orderId = actionId.replace('REJECT_ORDER_', '');
+                    const orderRef = db.collection('prescription_orders').doc(orderId);
+                    const orderSnap = await orderRef.get();
+
+                    if (!orderSnap.exists || orderSnap.data().status !== 'pending_pharmacist_review') {
+                        await sendWhatsAppMessage(from, "⚠️ هذا الطلب تمت معالجته بالفعل أو غير موجود.");
+                        return res.sendStatus(200);
+                    }
+
+                    const order = orderSnap.data();
+                    await orderRef.update({ status: 'rejected', rejected_at: new Date() });
+                    await sendWhatsAppMessage(from, "تم رفض الطلب ❌");
+                    await sendWhatsAppMessage(order.patient_phone, "❌ عذراً، لم يتم تأكيد طلبك من الصيدلي. يرجى التواصل مع الصيدلية مباشرة للتفاصيل.");
+                }
             }
 
             // ==========================================
@@ -307,6 +405,8 @@ router.post('/webhook', async (req, res) => {
                     }
 
                     let replyMessage = "📝 **نتائج فحص الروشتة الذكي:**\nإليك الأدوية وحالة توفرها:\n\n";
+                    // 🆕 هنجمع هنا الأدوية المتوفرة فقط (اللي ليها stock) عشان نبني منها طلب حجز حقيقي
+                    let availableItems = [];
 
                     // 🔧 بدل الاستعلام القديم على مجموعة "pharmacy" وحقل "name" (اللي مش موجودين في قاعدة البيانات الحقيقية)،
                     // بنستخدم findMedicineDoc اللي هي نفس منطق المطابقة المستخدم في باقي البوت (عربي/إنجليزي/مرادفات/تشابه إملائي)
@@ -317,6 +417,7 @@ router.post('/webhook', async (req, res) => {
                             const item = doc.data();
                             if (item.stock > 0) {
                                 replyMessage += `✅ **${doc.id.toUpperCase()}**: متوفر (السعر: ${item.price})\n`;
+                                availableItems.push({ id: doc.id, price: item.price });
                             } else {
                                 replyMessage += `⚠️ **${doc.id.toUpperCase()}**: مسجل لكن غير متوفر بالمخزون حالياً.\n`;
                             }
@@ -325,8 +426,23 @@ router.post('/webhook', async (req, res) => {
                         }
                     }
 
-                    replyMessage += "\n💊 تحب تحجز الأدوية المتوفرة حالياً وتستلمها من مقر الصيدلية؟";
                     await sendWhatsAppMessage(from, replyMessage);
+
+                    // 🆕 لو فيه أدوية متوفرة فعلاً، بننشئ "طلب روشتة" (Draft) في Firestore ونعرض زرارين للمريض
+                    // بدل السؤال النصي القديم، وده اللي هيتحول بعدين لمراجعة الصيدلي (خطوة "Pharmacist confirmation")
+                    if (availableItems.length > 0) {
+                        const orderRef = await db.collection('prescription_orders').add({
+                            patient_phone: from,
+                            items: availableItems,
+                            status: 'draft', // draft -> pending_pharmacist_review -> confirmed / rejected / cancelled_by_patient
+                            created_at: new Date()
+                        });
+
+                        await sendInteractiveButtons(from, "💊 تحب تحجز الأدوية المتوفرة دي وتستلمها من مقر الصيدلية؟", [
+                            { id: `BOOK_ORDER_${orderRef.id}`, title: "📦 احجز الأدوية" },
+                            { id: `CANCEL_ORDER_${orderRef.id}`, title: "❌ لا شكراً" }
+                        ]);
+                    }
                 }
                 else if (analysis.type === 'insurance') {
                     let insuranceReply = `💳 **تم قراءة كارنيه التأمين بنجاح:**\n👤 الاسم: ${analysis.patient_name}\n🏢 الشركة: ${analysis.company}\n🔢 رقم: ${analysis.card_number}\n✅ تم تفعيل التغطية بنجاح!`;
