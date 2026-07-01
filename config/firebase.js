@@ -3,9 +3,9 @@ const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
 let serviceAccount;
 
-if (process.env.FIREBASE_CREDENTIALS) {
+if (process.env.FIREBASE_CONFIG) {
     // 1. لو إحنا على سيرفر Render، هيقرأ المفتاح من الـ Environment Variables
-    serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
+    serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
 } else {
     // 2. لو إحنا على جهازك (Local)، هيقرأ الملف بتاعك عادي جداً
     serviceAccount = require('../firebase-key.json');
