@@ -6,6 +6,8 @@ const bodyParser = require('body-parser');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
 const serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
+
+// الاتصال بـ Firebase
 initializeApp({
     credential: cert(serviceAccount)
 });
@@ -21,7 +23,7 @@ app.use(bodyParser.json());
 // ---------------------------------------------------------
 // 3. الدوال الفعلية التي ستتحدث مع Firestore
 // ---------------------------------------------------------
-// خريطة مرادفات: الاسم العلمي (اللي الـ AI بيترجم له) -> الاسم التجاري (اللي متسجل في الداتابيز)
+// خريطة مرادفات: الاسم العلمي (اللي الـ AI ممكن يفكر فيه) -> الاسم التجاري (اللي متسجل في الداتابيز)
 const MEDICINE_SYNONYMS = {
     ibuprofen: "brufen",
     paracetamol: "panadol",
@@ -36,12 +38,58 @@ const MEDICINE_SYNONYMS = {
     nifuroxazide: "antinal"
 };
 
-// بيدور على الدواء بأكتر من طريقة: الاسم زي ما هو، ثم مرادفه التجاري، ثم مطابقة جزئية في الداتابيز كله
-async function findMedicineDoc(nameClean) {
+// خريطة مباشرة: الاسم بالعربي (زي ما المريض بيكتبه فعلاً) -> مفتاح الدواء في الداتابيز
+// دي أهم خطوة: بتمنع الـ AI من الاضطرار لتخمين تهجية إنجليزية غلط لاسم عربي
+const ARABIC_MEDICINE_MAP = {
+    "بانادول": "panadol",
+    "كونجستال": "congestal",
+    "بروفين": "brufen",
+    "أوجمنتين": "augmentin", "اوجمنتين": "augmentin",
+    "كتافلام": "cataflam", "كاتافلام": "cataflam",
+    "كومتركس": "comtrex",
+    "أوتريفين": "otrivin", "اوتريفين": "otrivin",
+    "كونكور": "concor",
+    "كونترولوك": "controloc",
+    "الفينترن": "alphintern", "ألفينترن": "alphintern",
+    "أنتينال": "antinal", "انتينال": "antinal",
+    "نيكسيوم": "nexium",
+    "كيتوفان": "ketofan",
+    "كلاريتين": "claritine",
+    "فولتارين": "voltaren"
+};
+
+function levenshtein(a, b) {
+    const m = a.length, n = b.length;
+    const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+    for (let i = 0; i <= m; i++) dp[i][0] = i;
+    for (let j = 0; j <= n; j++) dp[0][j] = j;
+    for (let i = 1; i <= m; i++) {
+        for (let j = 1; j <= n; j++) {
+            dp[i][j] = a[i - 1] === b[j - 1]
+                ? dp[i - 1][j - 1]
+                : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+        }
+    }
+    return dp[m][n];
+}
+
+// بيدور على الدواء بكل الطرق الممكنة: عربي مباشر -> إنجليزي مطابق -> مرادف علمي -> مطابقة جزئية -> تشابه إملائي (Fuzzy)
+async function findMedicineDoc(rawName) {
+    const trimmedRaw = rawName.trim();
+    const nameClean = trimmedRaw.toLowerCase();
+
+    // 1. مطابقة مباشرة من الخريطة العربية (الأدق والأضمن)
+    if (ARABIC_MEDICINE_MAP[trimmedRaw]) {
+        const doc = await db.collection('medicines').doc(ARABIC_MEDICINE_MAP[trimmedRaw]).get();
+        if (doc.exists) return { docRef: doc.ref, doc };
+    }
+
+    // 2. مطابقة مباشرة بالاسم الإنجليزي زي ما هو
     let docRef = db.collection('medicines').doc(nameClean);
     let doc = await docRef.get();
     if (doc.exists) return { docRef, doc };
 
+    // 3. مرادف علمي (زي ibuprofen -> brufen)
     const brandName = MEDICINE_SYNONYMS[nameClean];
     if (brandName) {
         docRef = db.collection('medicines').doc(brandName);
@@ -49,28 +97,61 @@ async function findMedicineDoc(nameClean) {
         if (doc.exists) return { docRef, doc };
     }
 
-    // مطابقة جزئية احتياطية: لو الاسم اللي بعته الـ AI جزء من اسم دواء مسجل أو العكس
+    // 4. مطابقة جزئية + تشابه إملائي (بيمسك الأخطاء المطبعية القريبة زي cometrix/cometric لـ comtrex)
     const snapshot = await db.collection('medicines').get();
+    let bestMatch = null;
+    let bestDistance = Infinity;
     for (const d of snapshot.docs) {
         if (d.id.includes(nameClean) || nameClean.includes(d.id)) {
             return { docRef: d.ref, doc: d };
         }
+        const dist = levenshtein(nameClean, d.id);
+        if (dist < bestDistance) {
+            bestDistance = dist;
+            bestMatch = d;
+        }
+    }
+    // عتبة التشابه: يسمح بغلطتين-تلاتة إملائية بحد أقصى، وبس لو الاسم مش قصير جداً (عشان منغلطش بين أسماء قصيرة مختلفة)
+    if (bestMatch && nameClean.length >= 4 && bestDistance <= 3) {
+        return { docRef: bestMatch.ref, doc: bestMatch };
     }
 
     return { docRef: null, doc: null };
 }
 
+// أيام العامية المصرية -> الاسم الرسمي المسجل في الداتابيز (زي "الحد" اللي معناها "الأحد")
+const DAY_SYNONYMS = {
+    "حد": "الأحد", "الحد": "الأحد", "الأحد": "الأحد",
+    "اتنين": "الإثنين", "الاتنين": "الإثنين", "الإتنين": "الإثنين", "الإثنين": "الإثنين",
+    "تلات": "الثلاثاء", "التلات": "الثلاثاء", "الثلاثاء": "الثلاثاء", "التلاتاء": "الثلاثاء",
+    "اربع": "الأربعاء", "الاربع": "الأربعاء", "الأربعاء": "الأربعاء",
+    "خميس": "الخميس", "الخميس": "الخميس",
+    "جمعة": "الجمعة", "الجمعة": "الجمعة", "جمعه": "الجمعة", "الجمعه": "الجمعة",
+    "سبت": "السبت", "السبت": "السبت"
+};
+
+function normalizeDay(day) {
+    if (!day) return day;
+    const trimmed = day.trim();
+    return DAY_SYNONYMS[trimmed] || trimmed;
+}
+
+// بيتحقق هل نتيجة الدالة سلبية (دواء/طبيب غير موجود) عشان منعرضش سؤال حجز على حاجة غير موجودة
+function isNegativeResult(text) {
+    const negativePatterns = ["غير موجود", "غير متوفر", "لا يوجد", "لم نجد", "لا توجد"];
+    return negativePatterns.some(p => text.includes(p));
+}
+
 const functions = {
-    check_medicine_stock: async ({ medicine_name_english } = {}) => {
-        if (!medicine_name_english) return "عايز اسم الدواء بالإنجليزية عشان أقدر أبحث عنه.";
-        const nameClean = medicine_name_english.toLowerCase().trim();
-        const { doc } = await findMedicineDoc(nameClean);
+    check_medicine_stock: async ({ medicine_name } = {}) => {
+        if (!medicine_name) return "عايز اسم الدواء عشان أقدر أبحث عنه.";
+        const { doc } = await findMedicineDoc(medicine_name);
 
         if (!doc) return "هذا الدواء غير موجود في قاعدة بيانات المستشفى.";
 
         const item = doc.data();
-        if (item.stock > 0) return `متوفر. الكمية: ${item.stock}، السعر: ${item.price}.`;
-        return "الدواء مسجل لكن الكمية الحالية 0 (غير متوفر).";
+        if (item.stock > 0) return `متوفر (${doc.id}). الكمية: ${item.stock}، السعر: ${item.price}.`;
+        return `الدواء (${doc.id}) مسجل لكن الكمية الحالية 0 (غير متوفر).`;
     },
 
     get_available_appointments: async ({ doctor_name } = {}) => {
@@ -89,14 +170,15 @@ const functions = {
         const snapshot = await db.collection('doctors').get();
         if (snapshot.empty) return "لا يوجد أطباء مسجلين حالياً.";
 
-        let doctorsWithSchedules = day ? `إليك قائمة الأطباء المتاحين يوم ${day}:\n` : "إليك قائمة الأطباء المتواجدين ومواعيدهم:\n";
+        const normalizedDay = normalizeDay(day);
+        let doctorsWithSchedules = normalizedDay ? `إليك قائمة الأطباء المتاحين يوم ${normalizedDay}:\n` : "إليك قائمة الأطباء المتواجدين ومواعيدهم:\n";
         let hasAvailableDoctors = false;
 
         snapshot.forEach(doc => {
             const data = doc.data();
             if (data.appointments && data.appointments.length > 0) {
-                if (day) {
-                    const dayAppointments = data.appointments.filter(app => app.includes(day));
+                if (normalizedDay) {
+                    const dayAppointments = data.appointments.filter(app => app.includes(normalizedDay));
                     if (dayAppointments.length > 0) {
                         doctorsWithSchedules += `- دكتور ${doc.id}: مواعيده هي (${dayAppointments.join('، ')})\n`;
                         hasAvailableDoctors = true;
@@ -109,16 +191,15 @@ const functions = {
         });
 
         if (!hasAvailableDoctors) {
-            return day ? `عذراً، لا يوجد أطباء متاحين يوم ${day}.` : "عذراً، جميع مواعيد الأطباء محجوزة بالكامل في الوقت الحالي.";
+            return normalizedDay ? `عذراً، لا يوجد أطباء متاحين يوم ${normalizedDay}.` : "عذراً، جميع مواعيد الأطباء محجوزة بالكامل في الوقت الحالي.";
         }
 
         return doctorsWithSchedules;
     },
 
-    book_medicine: async ({ medicine_name_english, quantity } = {}) => {
-        if (!medicine_name_english) return "عايز اسم الدواء بالإنجليزية عشان أقدر أحجزه.";
-        const nameClean = medicine_name_english.toLowerCase().trim();
-        const { docRef, doc } = await findMedicineDoc(nameClean);
+    book_medicine: async ({ medicine_name, quantity } = {}) => {
+        if (!medicine_name) return "عايز اسم الدواء عشان أقدر أحجزه.";
+        const { docRef, doc } = await findMedicineDoc(medicine_name);
 
         if (!doc) return "عذراً، هذا الدواء غير متوفر في المستشفى.";
 
@@ -180,13 +261,13 @@ const tools = [
         type: "function",
         function: {
             name: "check_medicine_stock",
-            description: "تبحث هذه الدالة عن توافر الدواء في مخزن المستشفى. يجب ترجمة اسم الدواء للإنجليزية أولاً.",
+            description: "تبحث هذه الدالة عن توافر الدواء في مخزن المستشفى. مرر اسم الدواء زي ما قاله المريض بالضبط (عربي أو إنجليزي، مفيش داعي تترجمه أو تخمن تهجيته).",
             parameters: {
                 type: "object",
                 properties: {
-                    medicine_name_english: { type: "string", description: "اسم الدواء باللغة الإنجليزية (مثال: panadol)" }
+                    medicine_name: { type: "string", description: "اسم الدواء زي ما ذكره المريض حرفياً (عربي أو إنجليزي)" }
                 },
-                required: ["medicine_name_english"]
+                required: ["medicine_name"]
             }
         }
     },
@@ -194,7 +275,7 @@ const tools = [
         type: "function",
         function: {
             name: "get_available_appointments",
-            description: "تستعلم عن المواعيد المتاحة لطبيب معين في المستشفى.",
+            description: "تستعلم عن المواعيد المتاحة لطبيب معين بالاسم. استخدمها فقط لما المريض يحدد اسم طبيب بذاته. لو السؤال عن يوم معين لكل الأطباء (مثال: مين متاح يوم الخميس)، استخدم list_all_doctors بمعامل day بدل ما تنادي هذه الدالة لكل طبيب على حدة.",
             parameters: {
                 type: "object",
                 properties: {
@@ -208,11 +289,11 @@ const tools = [
         type: "function",
         function: {
             name: "list_all_doctors",
-            description: "تُرجع قائمة بأسماء الأطباء ومواعيدهم. يمكنها إرجاع كل الأطباء، أو تصفية الأطباء حسب يوم معين إذا طلبه المريض.",
+            description: "تُرجع قائمة بأسماء الأطباء ومواعيدهم. استخدمها دائماً (باستخدام معامل day) لأي سؤال عن الأطباء المتاحين في يوم معين — نداء واحد لهذه الدالة يكفي ويغطي كل الأطباء، ومفيش داعي لمناداة get_available_appointments لكل طبيب على حدة.",
             parameters: {
                 type: "object",
                 properties: {
-                    day: { type: "string", description: "اليوم المطلوب الاستعلام عنه (مثال: الخميس، الأحد). اتركه فارغاً إذا كان السؤال عاماً." }
+                    day: { type: "string", description: "اليوم المطلوب الاستعلام عنه زي ما قاله المريض بالضبط (مثال: الخميس، الحد، التلات). اتركه فارغاً إذا كان السؤال عاماً." }
                 }
             }
         }
@@ -221,14 +302,14 @@ const tools = [
         type: "function",
         function: {
             name: "book_medicine",
-            description: "تقوم هذه الدالة بحجز كمية معينة من دواء محدد وخصمها من المخزن. يجب ترجمة اسم الدواء للإنجليزية.",
+            description: "تقوم هذه الدالة بحجز كمية معينة من دواء محدد وخصمها من المخزن. مرر اسم الدواء زي ما قاله المريض بالضبط (عربي أو إنجليزي).",
             parameters: {
                 type: "object",
                 properties: {
-                    medicine_name_english: { type: "string", description: "اسم الدواء بالإنجليزية" },
+                    medicine_name: { type: "string", description: "اسم الدواء زي ما ذكره المريض حرفياً (عربي أو إنجليزي)" },
                     quantity: { type: "number", description: "الكمية المطلوبة للحجز (رقم صحيح)" }
                 },
-                required: ["medicine_name_english", "quantity"]
+                required: ["medicine_name", "quantity"]
             }
         }
     },
@@ -256,14 +337,19 @@ const tools = [
 const sessions = {};
 
 const SYSTEM_PROMPT = `أنت مساعد ذكي لمستشفى في مصر. وظيفتك مساعدة المرضى بأسلوب ودود ومختصر باللغة العربية الطبيعية.
-        
+
 قواعد الرد الأساسية (يجب الالتزام بها حرفياً):
-1. طباعة النتائج (أهم قاعدة): عندما تستخدم أداة (Tool) لجلب بيانات (مثل مواعيد الأطباء)، ممنوع منعاً باتاً أن تسأل المريض عن الخطوة التالية قبل أن تقوم بكتابة وعرض البيانات التي وجدتها للمريض في رسالتك.
-2. التنسيق: اعرض البيانات التي وجدتها دائماً في شكل نقاط (Bullet points) واضحة (كل طبيب في سطر).
-3. الاستئذان: بعد عرض القائمة التي طلبها المريض بالكامل، قم بسؤاله في نهاية الرسالة: "تحب تحجز مع مين فيهم؟".
-4. تأكيد الحجز: لا تقم بتشغيل دالة "book_appointment" إلا بعد أن يختار المريض الطبيب والميعاد، وتنتظر موافقته الصريحة.
-5. الأسماء: عند تمرير اسم الطبيب لأي دالة، مرر الاسم الأول فقط (مثال: مرر "سارة" وليس "الدكتورة سارة").
-6. الدقة (مهم جداً): ممنوع تشغيل أي دالة خاصة بدواء أو طبيب معين إلا إذا ذكر المريض اسمه بوضوح في رسالته. لو رسالة المريض غامضة (مثل "عايز أسأل عن دواء" أو "هو ايه؟") ولم تحدد اسماً صريحاً، لا تخترع اسم دواء أو طبيب من عندك أبداً — بل اسأل المريض مباشرة: "تحب تستفسر عن دواء إيه بالاسم؟" أو ما يعادلها حسب السياق.`;
+1. الكفاءة: لو السؤال عن الأطباء المتاحين في يوم معين لكل الأطباء (زي "مين متاح يوم الخميس")، نادِ list_all_doctors مرة واحدة فقط بمعامل day. لا تنادِ get_available_appointments لكل طبيب على حدة — ده هدر وقت وغير ضروري.
+2. تأكيد الحجز: لا تقم بتشغيل دالة "book_appointment" أو "book_medicine" إلا بعد أن يوافق المريض بوضوح على الاسم/الميعاد/الكمية المحددة.
+3. الأسماء: عند تمرير اسم الطبيب لأي دالة، مرر الاسم الأول فقط (مثال: مرر "سارة" وليس "الدكتورة سارة").
+4. الدقة (مهم جداً): ممنوع تشغيل أي دالة خاصة بدواء أو طبيب معين إلا إذا ذكر المريض اسمه بوضوح في رسالته. لو رسالة المريض غامضة (مثل "عايز أسأل عن دواء" أو "هو ايه؟") ولم تحدد اسماً صريحاً، لا تخترع اسم دواء أو طبيب من عندك أبداً — بل اسأل المريض مباشرة عن الاسم المطلوب.
+5. الأدوية: مرر اسم الدواء لدالة check_medicine_stock أو book_medicine زي ما قاله المريض بالضبط (عربي أو إنجليزي، بأي تهجية) — لا تترجمه ولا تخمن تهجية إنجليزية له، النظام هو اللي بيتولى المطابقة.
+
+أمثلة على السلوك الصحيح (اتبعها بدقة):
+- مريض: "مين متاح يوم الاتنين؟" ← نادِ list_all_doctors مرة واحدة بـ day="الاتنين" فقط. (غلط: مناداة get_available_appointments لكل دكتور على حدة)
+- مريض: "عايز أستفسر عن دواء" (بدون اسم) ← لا تنادِ أي دالة؛ اسأله: "تحب تستفسر عن دواء إيه بالاسم؟"
+- مريض: "عايز كومتركس" ← نادِ check_medicine_stock بـ medicine_name="كومتركس" زي ما هو، بدون أي ترجمة أو تخمين.
+- مريض: "اه" (رداً على سؤال عن دواء غير موجود أصلاً) ← وضح له إن الدواء اللي سأل عنه قبل كده غير موجود، واسأله عن اسم تاني.`;
 
 // ---------------------------------------------------------
 // 5. محرك إدارة الحوار وتشغيل الدوال (Groq Engine)
@@ -353,7 +439,7 @@ async function processMessage(userText, userPhone) {
             // بنبني الرد مباشرة من نتيجة الدالة الحقيقية (نص جاهز ومنسق)
             // من غير ما نعتمد على الـ AI يعيد كتابتها تاني (فيه خطر يسهو عن بيانات أو يغيّر تفاصيل)
             let part = apiResponse;
-            if (!ACTION_FUNCTIONS.includes(functionName) && INFO_FOLLOWUPS[functionName]) {
+            if (!ACTION_FUNCTIONS.includes(functionName) && INFO_FOLLOWUPS[functionName] && !isNegativeResult(apiResponse)) {
                 part += `\n\n${INFO_FOLLOWUPS[functionName]}`;
             }
             replyParts.push(part);
