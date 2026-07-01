@@ -12,5 +12,17 @@ function isNegativeResult(text) {
     const negativePatterns = ["غير موجود", "غير متوفر", "لا يوجد", "لم نجد", "لا توجد"];
     return negativePatterns.some(p => text.includes(p));
 }
+function formatArabicDate(isoString) {
+    const date = new Date(isoString);
+    return date.toLocaleString('ar-EG', { 
+        weekday: 'long', 
+        month: 'short', 
+        day: 'numeric', 
+        hour: 'numeric', 
+        hour12: true,
+        timeZone: 'Africa/Cairo'
+    });
+}
 
-module.exports = { normalizeDay, isNegativeResult };
+// ضيفها في الـ exports
+module.exports = { normalizeDay, isNegativeResult, formatArabicDate };

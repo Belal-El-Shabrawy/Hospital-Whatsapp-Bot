@@ -1,6 +1,6 @@
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
-const serviceAccount = require('./serviceAccountKey.json');
+const serviceAccount = require('./firebase-key.json');
 const { MEDICINE_DATABASE, DOCTOR_DATABASE } = require('./data/seedData');
 
 initializeApp({
