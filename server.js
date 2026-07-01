@@ -21,16 +21,52 @@ app.use(bodyParser.json());
 // ---------------------------------------------------------
 // 3. الدوال الفعلية التي ستتحدث مع Firestore
 // ---------------------------------------------------------
+    ibuprofen: "brufen",
+    paracetamol: "panadol",
+    acetaminophen: "panadol",
+    amoxicillin: "augmentin",
+    diclofenac: "voltaren",
+    esomeprazole: "nexium",
+    pantoprazole: "controloc",
+    loratadine: "claritine",
+    xylometazoline: "otrivin",
+    loperamide: "antinal",
+    nifuroxazide: "antinal"
+};
+
+// بيدور على الدواء بأكتر من طريقة: الاسم زي ما هو، ثم مرادفه التجاري، ثم مطابقة جزئية في الداتابيز كله
+async function findMedicineDoc(nameClean) {
+    let docRef = db.collection('medicines').doc(nameClean);
+    let doc = await docRef.get();
+    if (doc.exists) return { docRef, doc };
+
+    const brandName = MEDICINE_SYNONYMS[nameClean];
+    if (brandName) {
+        docRef = db.collection('medicines').doc(brandName);
+        doc = await docRef.get();
+        if (doc.exists) return { docRef, doc };
+    }
+
+    // مطابقة جزئية احتياطية: لو الاسم اللي بعته الـ AI جزء من اسم دواء مسجل أو العكس
+    const snapshot = await db.collection('medicines').get();
+    for (const d of snapshot.docs) {
+        if (d.id.includes(nameClean) || nameClean.includes(d.id)) {
+            return { docRef: d.ref, doc: d };
+        }
+    }
+
+    return { docRef: null, doc: null };
+}
+
 const functions = {
     check_medicine_stock: async ({ medicine_name_english } = {}) => {
         if (!medicine_name_english) return "عايز اسم الدواء بالإنجليزية عشان أقدر أبحث عنه.";
         const nameClean = medicine_name_english.toLowerCase().trim();
-        const docRef = db.collection('medicines').doc(nameClean);
-        const doc = await docRef.get();
+        const { doc } = await findMedicineDoc(nameClean);
 
-        if (!doc.exists) return "هذا الدواء غير موجود في قاعدة بيانات المستشفى.";
-        
-        const item = doc.data(); 
+        if (!doc) return "هذا الدواء غير موجود في قاعدة بيانات المستشفى.";
+
+        const item = doc.data();
         if (item.stock > 0) return `متوفر. الكمية: ${item.stock}، السعر: ${item.price}.`;
         return "الدواء مسجل لكن الكمية الحالية 0 (غير متوفر).";
     },
@@ -80,17 +116,16 @@ const functions = {
     book_medicine: async ({ medicine_name_english, quantity } = {}) => {
         if (!medicine_name_english) return "عايز اسم الدواء بالإنجليزية عشان أقدر أحجزه.";
         const nameClean = medicine_name_english.toLowerCase().trim();
-        const docRef = db.collection('medicines').doc(nameClean);
-        const doc = await docRef.get();
+        const { docRef, doc } = await findMedicineDoc(nameClean);
 
-        if (!doc.exists) return "عذراً، هذا الدواء غير متوفر في المستشفى.";
+        if (!doc) return "عذراً، هذا الدواء غير متوفر في المستشفى.";
 
         const item = doc.data();
         const reqQty = quantity || 1;
 
         if (item.stock >= reqQty) {
             await docRef.update({ stock: item.stock - reqQty });
-            return `تم حجز عدد ${reqQty} من دواء ${nameClean} بنجاح. رصيد المخزن المتبقي: ${item.stock - reqQty}.`;
+            return `تم حجز عدد ${reqQty} من دواء ${doc.id} بنجاح. رصيد المخزن المتبقي: ${item.stock - reqQty}.`;
         } else {
             return `عذراً، الكمية المطلوبة غير متوفرة. المتاح في المخزن حالياً هو ${item.stock} علبة فقط.`;
         }
@@ -248,13 +283,36 @@ async function processMessage(userText, userPhone) {
     const userMessageWithPhone = `[رقم المريض: ${userPhone}] رسالة المريض: ${userText}`;
     chatHistory.push({ role: "user", content: userMessageWithPhone });
 
-    const response = await groq.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
-        messages: chatHistory,
-        tools: tools,
-        tool_choice: "auto",
-        temperature: 0 // بيقلل التخبيط في استخراج الأسماء/الأيام كمعاملات للدوال
-    });
+    let response;
+    try {
+        response = await groq.chat.completions.create({
+            model: "llama-3.3-70b-versatile",
+            messages: chatHistory,
+            tools: tools,
+            tool_choice: "auto",
+            temperature: 0 // بيقلل التخبيط في استخراج الأسماء/الأيام كمعاملات للدوال
+        });
+    } catch (error) {
+        if (error.status === 429) {
+            console.warn("⚠️ الموديل الأساسي وصل للحد اليومي، بنجرب موديل بديل أخف...");
+            try {
+                // llama-3.1-8b-instant له حصة يومية مختلفة عن 70b، فبيفضل شغال لو التوكنز بتاعة الموديل التاني خلصت
+                response = await groq.chat.completions.create({
+                    model: "llama-3.1-8b-instant",
+                    messages: chatHistory,
+                    tools: tools,
+                    tool_choice: "auto",
+                    temperature: 0
+                });
+            } catch (fallbackError) {
+                // لو الموديلين وصلوا للحد، بنرجع رسالة واضحة للمريض بدل ما يفضل مستني رد ومايجيله حاجة
+                chatHistory.pop(); // نشيل رسالة المريض اللي مش هتترد عشان منزحمش الذاكرة برسالة من غير رد
+                return "عذراً، النظام مشغول جداً حالياً بسبب عدد الرسائل الكبير. من فضلك حاول تاني بعد كذا دقيقة 🙏";
+            }
+        } else {
+            throw error; // أي خطأ تاني (شبكة، إلخ) يفضل يترمي عادي عشان نلاحظه في اللوج
+        }
+    }
 
     const responseMessage = response.choices[0].message;
     chatHistory.push(responseMessage);
@@ -375,6 +433,8 @@ app.post('/webhook', async (req, res) => {
                 
             } catch (error) {
                 console.error("❌ حدث خطأ في معالجة الرسالة:", error);
+                // مهم: نرد على المريض برسالة حتى لو حصل خطأ غير متوقع، بدل ما ينسحب بدون رد
+                await sendWhatsAppMessage(from, "عذراً، حصل خطأ مؤقت من عندنا. حاول تبعت رسالتك تاني بعد قليل 🙏");
             }
         }
         res.sendStatus(200); 
