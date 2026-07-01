@@ -24,7 +24,8 @@ app.use(bodyParser.json());
 // 3. الدوال الفعلية التي ستتحدث مع Firestore
 // ---------------------------------------------------------
 const functions = {
-    check_medicine_stock: async ({ medicine_name_english }) => {
+    check_medicine_stock: async ({ medicine_name_english } = {}) => {
+        if (!medicine_name_english) return "عايز اسم الدواء بالإنجليزية عشان أقدر أبحث عنه.";
         const nameClean = medicine_name_english.toLowerCase().trim();
         const docRef = db.collection('medicines').doc(nameClean);
         const doc = await docRef.get();
@@ -36,7 +37,8 @@ const functions = {
         return "الدواء مسجل لكن الكمية الحالية 0 (غير متوفر).";
     },
 
-    get_available_appointments: async ({ doctor_name }) => {
+    get_available_appointments: async ({ doctor_name } = {}) => {
+        if (!doctor_name) return "عايز اسم الدكتور اللي محتاج تعرف مواعيده.";
         let cleanName = doctor_name.replace(/الدكتورة|الدكتور|دكتورة|دكتور|د\./g, '').trim();
         const docRef = db.collection('doctors').doc(cleanName);
         const doc = await docRef.get();
@@ -47,7 +49,7 @@ const functions = {
         return `المواعيد المتاحة للدكتور ${cleanName} هي: ${data.appointments.join('، ')}.`;
     },
 
-    list_all_doctors: async ({ day }) => {
+    list_all_doctors: async ({ day } = {}) => {
         const snapshot = await db.collection('doctors').get();
         if (snapshot.empty) return "لا يوجد أطباء مسجلين حالياً.";
 
@@ -77,7 +79,8 @@ const functions = {
         return doctorsWithSchedules;
     },
 
-    book_medicine: async ({ medicine_name_english, quantity }) => {
+    book_medicine: async ({ medicine_name_english, quantity } = {}) => {
+        if (!medicine_name_english) return "عايز اسم الدواء بالإنجليزية عشان أقدر أحجزه.";
         const nameClean = medicine_name_english.toLowerCase().trim();
         const docRef = db.collection('medicines').doc(nameClean);
         const doc = await docRef.get();
@@ -95,7 +98,8 @@ const functions = {
         }
     },
 
-    book_appointment: async ({ doctor_name, appointment_time, patient_phone }) => {
+    book_appointment: async ({ doctor_name, appointment_time, patient_phone } = {}) => {
+        if (!doctor_name || !appointment_time) return "محتاج اسم الدكتور والميعاد المطلوب عشان أقدر أأكد الحجز.";
         let cleanName = doctor_name.replace(/الدكتورة|الدكتور|دكتورة|دكتور|د\./g, '').trim();
         
         const doctorRef = db.collection('doctors').doc(cleanName);
@@ -250,48 +254,56 @@ async function processMessage(userText, userPhone) {
         model: "llama-3.3-70b-versatile",
         messages: chatHistory,
         tools: tools,
-        tool_choice: "auto"
+        tool_choice: "auto",
+        temperature: 0 // بيقلل التخبيط في استخراج الأسماء/الأيام كمعاملات للدوال
     });
 
     const responseMessage = response.choices[0].message;
     chatHistory.push(responseMessage);
 
+    // الدوال اللي بترجع بيانات (استعلام) وبعد عرضها لازم نسأل المريض سؤال متابعة
+    const INFO_FOLLOWUPS = {
+        list_all_doctors: "تحب تحجز مع مين فيهم؟",
+        get_available_appointments: "تحب تحجز الميعاد ده؟",
+        check_medicine_stock: "تحب تحجز الدواء ده؟"
+    };
+    // الدوال دي بترجع تأكيد نهائي (حجز/خصم) ومفيش داعي لسؤال بعدها
+    const ACTION_FUNCTIONS = ["book_medicine", "book_appointment"];
+
     if (responseMessage.tool_calls) {
+        const replyParts = [];
+
         for (const toolCall of responseMessage.tool_calls) {
             const functionName = toolCall.function.name;
-            const functionArgs = JSON.parse(toolCall.function.arguments);
-            
-            console.log(`🤖 الـ AI يطلب تشغيل الدالة: ${functionName}`);
-            
+            // بعض الأحيان الموديل بيبعت الـ arguments كـ "null" (سترينج) لما الدالة مش محتاجة معاملات
+            // فبنتأكد إنها Object فاضي مش null قبل ما نحاول نفكها (destructure)
+            const parsedArgs = JSON.parse(toolCall.function.arguments || "{}");
+            const functionArgs = parsedArgs || {};
+
+            console.log(`🤖 الـ AI يطلب تشغيل الدالة: ${functionName}`, functionArgs);
+
             const apiResponse = await functions[functionName](functionArgs);
-            
+
             chatHistory.push({
                 tool_call_id: toolCall.id,
                 role: "tool",
                 name: functionName,
                 content: apiResponse
             });
+
+            // بنبني الرد مباشرة من نتيجة الدالة الحقيقية (نص جاهز ومنسق)
+            // من غير ما نعتمد على الـ AI يعيد كتابتها تاني (فيه خطر يسهو عن بيانات أو يغيّر تفاصيل)
+            let part = apiResponse;
+            if (!ACTION_FUNCTIONS.includes(functionName) && INFO_FOLLOWUPS[functionName]) {
+                part += `\n\n${INFO_FOLLOWUPS[functionName]}`;
+            }
+            replyParts.push(part);
         }
 
-        // 🔥 التريكة السحرية (الحقن اللحظي) 🔥
-        // بنعمل مصفوفة مؤقتة نبعتها للموديل في الطلب التاني، فيها أمر إجباري في آخر سطر
-        const tempMessagesForFinalResponse = [
-            ...chatHistory,
-            {
-                role: "system",
-                content: "أمر إجباري: بناءً على البيانات التي استرجعتها للتو، يجب عليك طباعتها نصاً وبشكل مفصل للمريض في رسالتك الآن (استخدم النقاط)، ولا تقم أبداً بتوجيه سؤال له قبل عرض هذه البيانات أمامه."
-            }
-        ];
+        const finalReply = replyParts.join("\n\n---\n\n");
 
-        const finalResponse = await groq.chat.completions.create({
-            model: "llama-3.3-70b-versatile",
-            messages: tempMessagesForFinalResponse // بعتنا المصفوفة المؤقتة اللي فيها الأمر
-        });
-
-        const finalReply = finalResponse.choices[0].message.content;
-        
-        // بنحفظ الرد النهائي في الذاكرة الحقيقية للمريض (من غير الأمر المؤقت عشان منزحمش الذاكرة)
-        chatHistory.push({ role: "assistant", content: finalReply }); 
+        // بنحفظ الرد النهائي في ذاكرة المريض
+        chatHistory.push({ role: "assistant", content: finalReply });
         return finalReply;
     }
 
@@ -300,7 +312,7 @@ async function processMessage(userText, userPhone) {
 // ---------------------------------------------------------
 // 6. مسارات السيرفر (Webhooks)
 // ---------------------------------------------------------
-const VERIFY_TOKEN = "my_super_secret_token_123"; 
+const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "my_super_secret_token_123";
 
 app.get('/webhook', (req, res) => {
     let mode = req.query['hub.mode'];
@@ -313,6 +325,39 @@ app.get('/webhook', (req, res) => {
         res.sendStatus(403);
     }
 });
+
+async function sendWhatsAppMessage(toPhone, messageText) {
+    const ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
+    const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
+
+    const url = `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`;
+
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${ACCESS_TOKEN}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                messaging_product: "whatsapp",
+                to: toPhone,
+                text: { body: messageText }
+            })
+        });
+
+        const data = await response.json();
+        
+        if (!response.ok) {
+            console.error("\n❌ ميتا رفضت إرسال الرسالة، والسبب:", JSON.stringify(data, null, 2));
+        } else {
+            console.log("✅ تم إرسال الرسالة للواتساب بنجاح!");
+        }
+
+    } catch (error) {
+        console.error("❌ خطأ داخلي في السيرفر أثناء الإرسال:", error.message);
+    }
+}
 
 app.post('/webhook', async (req, res) => {
     let body = req.body;
@@ -327,6 +372,9 @@ app.post('/webhook', async (req, res) => {
             try {
                 const aiReply = await processMessage(msgBody, from);
                 console.log(`✅ رد الـ AI النهائي: ${aiReply}`);
+                
+                await sendWhatsAppMessage(from, aiReply);
+                
             } catch (error) {
                 console.error("❌ حدث خطأ في معالجة الرسالة:", error);
             }
