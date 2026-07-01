@@ -15,11 +15,10 @@ function bufferToGenerativePart(buffer, mimeType) {
 
 async function analyzeHospitalImage(imageBuffer, mimeType = "image/jpeg") {
     try {
-        const model = genAI.getGenerativeModel({ 
-            model: "gemini-1.5-flash",
-            generationConfig: { responseMimeType: "application/json" } // إجبار الموديل يرجع JSON
+       const model = genAI.getGenerativeModel({ 
+            model: "gemini-1.5-pro-latest", // غيرنا اسم الموديل هنا
+            generationConfig: { responseMimeType: "application/json" } 
         });
-
         const imagePart = bufferToGenerativePart(imageBuffer, mimeType);
 
         const prompt = `
