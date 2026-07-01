@@ -8,7 +8,6 @@ const findMedicineDoc = require('../services/medicineService');
 const { sendWhatsAppMessage, sendInteractiveButtons, sendInteractiveList, downloadWhatsAppImage } = require('../services/whatsapp');
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "my_super_secret_token_123";
-// رقم واتساب الصيدلي المسؤول عن مراجعة طلبات الروشتات قبل التأكيد النهائي (خطوة "Pharmacist confirmation" في الفلو)
 const PHARMACIST_PHONE_NUMBER = process.env.PHARMACIST_PHONE_NUMBER || null;
 
 router.get('/webhook', (req, res) => {
@@ -172,6 +171,42 @@ router.post('/webhook', async (req, res) => {
                     }
                 }
 
+                // ==========================================
+                // 🆕 المريض دوس "احجز الأدوية" بعد فحص الروشتة
+                // بنحول الطلب لحالة "مراجعة الصيدلي" ونبعتله رسالة فيها زرارين تأكيد/رفض (خطوة Pharmacist confirmation في الفلو)
+                // ملحوظة: لازم يتحط قبل فحص 'BOOK_' العام، لأن 'BOOK_ORDER_xxx' بتبدأ بـ 'BOOK_' برضه
+                // وكانت بتقع غلط في فرع حجز الطبيب (ده كان سبب: Cannot read properties of undefined (reading 'appointments'))
+                // ==========================================
+                else if (actionId.startsWith('BOOK_ORDER_')) {
+                    const orderId = actionId.replace('BOOK_ORDER_', '');
+                    const orderRef = db.collection('prescription_orders').doc(orderId);
+                    const orderSnap = await orderRef.get();
+
+                    if (!orderSnap.exists || orderSnap.data().status !== 'draft') {
+                        await sendWhatsAppMessage(from, "❌ عذراً، هذا الطلب لم يعد متاحاً (ربما تم التعامل معه بالفعل).");
+                        return res.sendStatus(200);
+                    }
+
+                    const order = orderSnap.data();
+                    await orderRef.update({ status: 'pending_pharmacist_review', requested_at: new Date() });
+
+                    await sendWhatsAppMessage(from, "⏳ تم إرسال طلبك للصيدلي للمراجعة والتأكيد، هنبلغك فور الرد.");
+
+                    if (PHARMACIST_PHONE_NUMBER) {
+                        let itemsList = order.items.map(it => `- ${it.id.toUpperCase()} (${it.price})`).join('\n');
+                        await sendInteractiveButtons(
+                            PHARMACIST_PHONE_NUMBER,
+                            `📋 طلب روشتة جديد يحتاج مراجعتك\nمن المريض: ${from}\n\nالأدوية:\n${itemsList}`,
+                            [
+                                { id: `CONFIRM_ORDER_${orderId}`, title: "✅ تأكيد الطلب" },
+                                { id: `REJECT_ORDER_${orderId}`, title: "❌ رفض الطلب" }
+                            ]
+                        );
+                    } else {
+                        console.warn("⚠️ PHARMACIST_PHONE_NUMBER غير مُعرّف في .env — لن يتم إرسال الطلب لأي صيدلي للمراجعة.");
+                    }
+                }
+
                 else if (actionId.startsWith('BOOK_')) {
                     let parts = actionId.split('_');
                     let doctorName = parts[1];
@@ -228,6 +263,15 @@ router.post('/webhook', async (req, res) => {
                     }
                 }
 
+                // المريض دوس "لا شكراً" بعد فحص الروشتة
+                // ملحوظة: لازم يتحط قبل فحص 'CANCEL_' العام، لأن 'CANCEL_ORDER_xxx' بتبدأ بـ 'CANCEL_' برضه
+                // وكانت بتقع غلط في فرع إلغاء الحجز (ده كان سبب: No document to update: .../reservations/ORDER)
+                else if (actionId.startsWith('CANCEL_ORDER_')) {
+                    const orderId = actionId.replace('CANCEL_ORDER_', '');
+                    await db.collection('prescription_orders').doc(orderId).update({ status: 'cancelled_by_patient' });
+                    await sendWhatsAppMessage(from, "تم الإلغاء. لو احتجت أي حاجة تانية أنا موجود 🙌");
+                }
+
                 else if (actionId.startsWith('CANCEL_')) {
                     let parts = actionId.split('_');
                     let reservationId = parts[1];
@@ -274,47 +318,6 @@ router.post('/webhook', async (req, res) => {
 
                 else if (actionId === 'FLOW_PHARMACY') {
                     await sendWhatsAppMessage(from, "مرحباً بك في الصيدلية 💊. أرسل اسم الدواء الذي تبحث عنه أو قم بتصوير الروشتة وسأقوم بفحصها فوراً.");
-                }
-
-                // ==========================================
-                // 🆕 المريض دوس "احجز الأدوية" بعد فحص الروشتة
-                // بنحول الطلب لحالة "مراجعة الصيدلي" ونبعتله رسالة فيها زرارين تأكيد/رفض (خطوة Pharmacist confirmation في الفلو)
-                // ==========================================
-                else if (actionId.startsWith('BOOK_ORDER_')) {
-                    const orderId = actionId.replace('BOOK_ORDER_', '');
-                    const orderRef = db.collection('prescription_orders').doc(orderId);
-                    const orderSnap = await orderRef.get();
-
-                    if (!orderSnap.exists || orderSnap.data().status !== 'draft') {
-                        await sendWhatsAppMessage(from, "❌ عذراً، هذا الطلب لم يعد متاحاً (ربما تم التعامل معه بالفعل).");
-                        return res.sendStatus(200);
-                    }
-
-                    const order = orderSnap.data();
-                    await orderRef.update({ status: 'pending_pharmacist_review', requested_at: new Date() });
-
-                    await sendWhatsAppMessage(from, "⏳ تم إرسال طلبك للصيدلي للمراجعة والتأكيد، هنبلغك فور الرد.");
-
-                    if (PHARMACIST_PHONE_NUMBER) {
-                        let itemsList = order.items.map(it => `- ${it.id.toUpperCase()} (${it.price})`).join('\n');
-                        await sendInteractiveButtons(
-                            PHARMACIST_PHONE_NUMBER,
-                            `📋 طلب روشتة جديد يحتاج مراجعتك\nمن المريض: ${from}\n\nالأدوية:\n${itemsList}`,
-                            [
-                                { id: `CONFIRM_ORDER_${orderId}`, title: "✅ تأكيد الطلب" },
-                                { id: `REJECT_ORDER_${orderId}`, title: "❌ رفض الطلب" }
-                            ]
-                        );
-                    } else {
-                        console.warn("⚠️ PHARMACIST_PHONE_NUMBER غير مُعرّف في .env — لن يتم إرسال الطلب لأي صيدلي للمراجعة.");
-                    }
-                }
-
-                // المريض دوس "لا شكراً" بعد فحص الروشتة
-                else if (actionId.startsWith('CANCEL_ORDER_')) {
-                    const orderId = actionId.replace('CANCEL_ORDER_', '');
-                    await db.collection('prescription_orders').doc(orderId).update({ status: 'cancelled_by_patient' });
-                    await sendWhatsAppMessage(from, "تم الإلغاء. لو احتجت أي حاجة تانية أنا موجود 🙌");
                 }
 
                 // ==========================================

@@ -1,21 +1,18 @@
 {
-  "name": "hospital-system",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "hospital-whatsapp-bot",
+  "version": "2.0.0",
+  "description": "بوت واتساب لمستشفى: حجز أدوية ومواعيد دكاترة + قراءة روشتات وكارنيهات تأمين بالصور، عبر Groq (نص + رؤية) و Firebase",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "seed": "node seed.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
     "@aws-sdk/client-textract": "^3.606.0",
-    "body-parser": "^2.3.0",
-    "dotenv": "^17.4.2",
-    "express": "^5.2.1",
-    "firebase-admin": "^14.1.0",
-    "groq-sdk": "^1.3.0"
+    "body-parser": "^1.20.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "firebase-admin": "^12.1.0",
+    "groq-sdk": "^0.5.0"
   }
 }
