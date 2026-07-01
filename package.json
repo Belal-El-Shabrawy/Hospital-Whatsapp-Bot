@@ -11,7 +11,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@google/generative-ai": "^0.24.1",
+    "@aws-sdk/client-textract": "^3.606.0",
     "body-parser": "^2.3.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
