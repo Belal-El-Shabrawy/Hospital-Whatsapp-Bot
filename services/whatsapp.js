@@ -1,10 +1,10 @@
 const ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
 const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
+const GRAPH_URL = `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`;
 
 async function sendWhatsAppMessage(toPhone, messageText) {
-    const url = `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`;
     try {
-        const response = await fetch(url, {
+        const response = await fetch(GRAPH_URL, {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({ messaging_product: "whatsapp", to: toPhone, text: { body: messageText } })
@@ -16,14 +16,13 @@ async function sendWhatsAppMessage(toPhone, messageText) {
 }
 
 async function sendInteractiveButtons(toPhone, textBody, buttonsArray) {
-    const url = `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`;
     const formattedButtons = buttonsArray.map(btn => ({
         type: "reply",
         reply: { id: btn.id, title: btn.title }
     }));
-    
+
     try {
-        const response = await fetch(url, {
+        const response = await fetch(GRAPH_URL, {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -44,9 +43,8 @@ async function sendInteractiveButtons(toPhone, textBody, buttonsArray) {
 }
 
 async function sendInteractiveList(toPhone, textBody, buttonText, sectionsArray) {
-    const url = `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`;
     try {
-        const response = await fetch(url, {
+        const response = await fetch(GRAPH_URL, {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -66,7 +64,7 @@ async function sendInteractiveList(toPhone, textBody, buttonText, sectionsArray)
     } catch (error) { console.error("❌ خطأ داخلي:", error); }
 }
 
-// ضيف الدالة دي في ملف whatsapp.js
+// بيحمل صورة استلمها البوت من واتساب (روشتة/كارنيه تأمين) كـ Buffer عشان نبعتها لموديل الرؤية
 async function downloadWhatsAppImage(imageId) {
     try {
         // 1. نجيب رابط الصورة من ميتا باستخدام الـ ID
@@ -74,7 +72,7 @@ async function downloadWhatsAppImage(imageId) {
             headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }
         });
         const urlData = await urlResponse.json();
-        
+
         if (!urlData.url) {
             throw new Error("لم يتم العثور على رابط الصورة");
         }
@@ -83,10 +81,10 @@ async function downloadWhatsAppImage(imageId) {
         const imageResponse = await fetch(urlData.url, {
             headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }
         });
-        
+
         const arrayBuffer = await imageResponse.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer); // ده اللي هنبعته للـ AI
-        
+        const buffer = Buffer.from(arrayBuffer); // ده اللي هنبعته لموديل الرؤية
+
         return buffer;
     } catch (error) {
         console.error("❌ خطأ في تحميل الصورة من ميتا:", error);
@@ -94,5 +92,4 @@ async function downloadWhatsAppImage(imageId) {
     }
 }
 
-// متنساش تعملها تصدير في آخر الملف
 module.exports = { sendWhatsAppMessage, sendInteractiveButtons, sendInteractiveList, downloadWhatsAppImage };

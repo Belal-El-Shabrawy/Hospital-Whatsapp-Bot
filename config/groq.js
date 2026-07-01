@@ -1,4 +1,4 @@
-// إعداد Groq API
+// إعداد Groq API — العميل الوحيد المستخدم في المشروع كله (محادثة نصية + رؤية/صور)
 require('dotenv').config();
 const Groq = require("groq-sdk");
 

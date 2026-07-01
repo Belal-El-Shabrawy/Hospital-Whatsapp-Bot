@@ -1,4 +1,6 @@
 // تعريف الدوال للـ AI (بصيغة Groq/OpenAI)
+// ملاحظة: أداة "analyze_image" اللي كانت هنا قبل كده تمت إزالتها — الصور بيتم تحليلها مباشرة في routes/webhook.js
+// عبر visionEngine.js، ومفيش تنفيذ فعلي لها في functions/hospitalFunctions.js، فكانت ستتسبب في كراش لو الـ AI حاول يناديها.
 const tools = [
     {
         type: "function",

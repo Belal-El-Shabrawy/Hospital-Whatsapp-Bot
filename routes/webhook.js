@@ -1,9 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const { formatArabicDate } = require('../utils/helpers');
-const db = require('../config/firebase'); 
+const db = require('../config/firebase');
 const processMessage = require('../services/aiEngine');
 const { analyzeHospitalImage } = require('../services/visionEngine');
+const findMedicineDoc = require('../services/medicineService');
 const { sendWhatsAppMessage, sendInteractiveButtons, sendInteractiveList, downloadWhatsAppImage } = require('../services/whatsapp');
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "my_super_secret_token_123";
@@ -35,10 +36,10 @@ router.post('/webhook', async (req, res) => {
             if (message.type === 'text') {
                 let msgBody = message.text.body;
                 console.log(`📩 رسالة نصية من ${from}: ${msgBody}`);
-                
+
                 const greetings = ['اهلا', 'أهلا', 'مرحبا', 'مرحباً', 'سلام', 'السلام', 'hi', 'hello', 'القائمة', 'menu'];
                 const isGreeting = greetings.some(g => msgBody.toLowerCase().includes(g)) || msgBody.length <= 2;
-                
+
                 if (isGreeting) {
                     await sendInteractiveButtons(from, "مرحباً بك في المستشفى 🏥\nكيف يمكننا مساعدتك اليوم؟", [
                         { id: "FLOW_BOOK_DOCTOR", title: "👨‍⚕️ حجز طبيب" },
@@ -50,8 +51,8 @@ router.post('/webhook', async (req, res) => {
                     console.log(`✅ رد الـ AI: ${aiReply}`);
                     await sendWhatsAppMessage(from, aiReply);
                 }
-            } 
-            
+            }
+
             // ==========================================
             // 2. لو المريض ضغط على زرار أو قائمة
             // ==========================================
@@ -64,7 +65,7 @@ router.post('/webhook', async (req, res) => {
                     const docs = await db.collection('doctors').get();
                     let specialties = new Set();
                     docs.forEach(d => specialties.add(d.data().specialty));
-                    
+
                     let rows = Array.from(specialties).map(spec => ({
                         id: `SPEC_${spec}`, title: `تخصص ${spec}`
                     }));
@@ -73,23 +74,23 @@ router.post('/webhook', async (req, res) => {
                         { title: "التخصصات المتاحة", rows: rows }
                     ]);
                 }
-                
+
                 else if (actionId.startsWith('SPEC_')) {
                     let selectedSpec = actionId.replace('SPEC_', '');
                     const docs = await db.collection('doctors').where('specialty', '==', selectedSpec).get();
-                    
+
                     let availableDays = new Set();
-                    let dayMap = {}; 
-                    
+                    let dayMap = {};
+
                     docs.forEach(d => {
                         let data = d.data();
                         if (data.appointments && data.appointments.length > 0) {
                             data.appointments.forEach(timeISO => {
                                 let dateKey = timeISO.split('T')[0];
                                 availableDays.add(dateKey);
-                                
+
                                 if (!dayMap[dateKey]) {
-                                    dayMap[dateKey] = formatArabicDate(timeISO).split('،')[0]; 
+                                    dayMap[dateKey] = formatArabicDate(timeISO).split('،')[0];
                                 }
                             });
                         }
@@ -98,7 +99,7 @@ router.post('/webhook', async (req, res) => {
                     if (availableDays.size > 0) {
                         let sortedDays = Array.from(availableDays).sort((a, b) => new Date(a) - new Date(b));
                         let rows = sortedDays.map(dateKey => ({
-                            id: `DAY_${selectedSpec}_${dateKey}`, 
+                            id: `DAY_${selectedSpec}_${dateKey}`,
                             title: dayMap[dateKey].substring(0, 24)
                         }));
 
@@ -123,10 +124,10 @@ router.post('/webhook', async (req, res) => {
                         if (data.appointments) {
                             let hasApptOnDate = data.appointments.some(timeISO => timeISO.startsWith(selectedDate));
                             if (hasApptOnDate) {
-                                rows.push({ 
-                                    id: `DOC_${d.id}_${selectedDate}`, 
-                                    title: `د. ${d.id}`, 
-                                    description: "متاح في هذا اليوم" 
+                                rows.push({
+                                    id: `DOC_${d.id}_${selectedDate}`,
+                                    title: `د. ${d.id}`,
+                                    description: "متاح في هذا اليوم"
                                 });
                             }
                         }
@@ -149,9 +150,9 @@ router.post('/webhook', async (req, res) => {
 
                     const docSnap = await db.collection('doctors').doc(doctorName).get();
                     let data = docSnap.data();
-                    
+
                     let dayAppointments = data.appointments.filter(timeISO => timeISO.startsWith(selectedDate));
-                    
+
                     let rows = dayAppointments.map(timeISO => {
                         let fullArabicDate = formatArabicDate(timeISO);
                         let displayTime = fullArabicDate.split('،').pop().trim();
@@ -174,7 +175,7 @@ router.post('/webhook', async (req, res) => {
                 else if (actionId.startsWith('BOOK_')) {
                     let parts = actionId.split('_');
                     let doctorName = parts[1];
-                    let timeISO = parts.slice(2).join('_'); 
+                    let timeISO = parts.slice(2).join('_');
 
                     const docRef = db.collection('doctors').doc(doctorName);
                     const docSnap = await docRef.get();
@@ -186,10 +187,10 @@ router.post('/webhook', async (req, res) => {
                         await docRef.update({ appointments: appointments });
 
                         await db.collection('reservations').add({
-                            doctor: doctorName, 
-                            time: timeISO, 
-                            patient_phone: from, 
-                            status: "confirmed", 
+                            doctor: doctorName,
+                            time: timeISO,
+                            patient_phone: from,
+                            status: "confirmed",
                             created_at: new Date()
                         });
 
@@ -213,11 +214,11 @@ router.post('/webhook', async (req, res) => {
                         snapshot.forEach(doc => {
                             let data = doc.data();
                             let displayTime = data.time.includes('T') ? formatArabicDate(data.time) : data.time;
-                            
-                            rows.push({ 
-                                id: `CANCEL_${doc.id}_${data.doctor}_${data.time}`, 
-                                title: `إلغاء: د. ${data.doctor}`, 
-                                description: `الموعد: ${displayTime}`.substring(0, 70) 
+
+                            rows.push({
+                                id: `CANCEL_${doc.id}_${data.doctor}_${data.time}`,
+                                title: `إلغاء: د. ${data.doctor}`,
+                                description: `الموعد: ${displayTime}`.substring(0, 70)
                             });
                         });
 
@@ -231,7 +232,7 @@ router.post('/webhook', async (req, res) => {
                     let parts = actionId.split('_');
                     let reservationId = parts[1];
                     let doctorName = parts[2];
-                    let timeISO = parts.slice(3).join('_'); 
+                    let timeISO = parts.slice(3).join('_');
 
                     try {
                         if (timeISO.includes('T')) {
@@ -242,7 +243,7 @@ router.post('/webhook', async (req, res) => {
                             if (diffInHours < 24) {
                                 let displayTime = formatArabicDate(timeISO);
                                 await sendWhatsAppMessage(from, `⚠️ عذراً، سياسة المستشفى تمنع إلغاء الموعد قبلها بأقل من 24 ساعة.\n\nموعدك مع د. ${doctorName} (${displayTime}) متبقي عليه أقل من يوم، يرجى التواصل هاتفياً.`);
-                                return;
+                                return res.sendStatus(200);
                             }
                         }
 
@@ -253,7 +254,7 @@ router.post('/webhook', async (req, res) => {
 
                         const docRef = db.collection('doctors').doc(doctorName);
                         const docSnap = await docRef.get();
-                        
+
                         if (docSnap.exists) {
                             let appointments = docSnap.data().appointments || [];
                             if (!appointments.includes(timeISO)) {
@@ -274,7 +275,7 @@ router.post('/webhook', async (req, res) => {
                 else if (actionId === 'FLOW_PHARMACY') {
                     await sendWhatsAppMessage(from, "مرحباً بك في الصيدلية 💊. أرسل اسم الدواء الذي تبحث عنه أو قم بتصوير الروشتة وسأقوم بفحصها فوراً.");
                 }
-            } 
+            }
 
             // ==========================================
             // 3. لو المريض بعت صورة (روشتة أو كارنيه تأمين)
@@ -283,7 +284,7 @@ router.post('/webhook', async (req, res) => {
                 let imageId = message.image.id;
                 let mimeType = message.image.mime_type || "image/jpeg";
                 console.log(`📸 استلام ميديا من ${from}، جاري المعالجة...`);
-                
+
                 await sendWhatsAppMessage(from, "⏳ جاري قراءة الصورة وفحص البيانات، لحظات من فضلك...");
 
                 const imageBuffer = await downloadWhatsAppImage(imageId);
@@ -308,16 +309,19 @@ router.post('/webhook', async (req, res) => {
                     }
 
                     let replyMessage = "📝 **نتائج فحص الروشتة الذكي:**\nإليك الأدوية وحالة توفرها:\n\n";
-                    
+
+                    // 🔧 بدل الاستعلام القديم على مجموعة "pharmacy" وحقل "name" (اللي مش موجودين في قاعدة البيانات الحقيقية)،
+                    // بنستخدم findMedicineDoc اللي هي نفس منطق المطابقة المستخدم في باقي البوت (عربي/إنجليزي/مرادفات/تشابه إملائي)
                     for (const medName of analysis.medicines) {
-                        const snapshot = await db.collection('pharmacy')
-                            .where('name', '>=', medName.toLowerCase())
-                            .where('name', '<=', medName.toLowerCase() + '\uf8ff')
-                            .get();
-                        
-                        if (!snapshot.empty) {
-                            let data = snapshot.docs[0].data();
-                            replyMessage += `✅ **${data.name.toUpperCase()}**: متوفر (السعر: ${data.price} ج.م)\n`;
+                        const { doc } = await findMedicineDoc(medName);
+
+                        if (doc) {
+                            const item = doc.data();
+                            if (item.stock > 0) {
+                                replyMessage += `✅ **${doc.id.toUpperCase()}**: متوفر (السعر: ${item.price})\n`;
+                            } else {
+                                replyMessage += `⚠️ **${doc.id.toUpperCase()}**: مسجل لكن غير متوفر بالمخزون حالياً.\n`;
+                            }
                         } else {
                             replyMessage += `❌ **${medName.toUpperCase()}**: غير متوفر حالياً.\n`;
                         }
@@ -325,7 +329,7 @@ router.post('/webhook', async (req, res) => {
 
                     replyMessage += "\n💊 تحب تحجز الأدوية المتوفرة حالياً وتستلمها من مقر الصيدلية؟";
                     await sendWhatsAppMessage(from, replyMessage);
-                } 
+                }
                 else if (analysis.type === 'insurance') {
                     let insuranceReply = `💳 **تم قراءة كارنيه التأمين بنجاح:**\n👤 الاسم: ${analysis.patient_name}\n🏢 الشركة: ${analysis.company}\n🔢 رقم: ${analysis.card_number}\n✅ تم تفعيل التغطية بنجاح!`;
                     await sendWhatsAppMessage(from, insuranceReply);

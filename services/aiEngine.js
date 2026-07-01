@@ -13,11 +13,24 @@ const INFO_FOLLOWUPS = {
     get_available_appointments: "تحب تحجز الميعاد ده؟",
     check_medicine_stock: "تحب تحجز الدواء ده؟"
 };
+
 // الدوال دي بترجع تأكيد نهائي (حجز/خصم) ومفيش داعي لسؤال بعدها
 const ACTION_FUNCTIONS = ["book_medicine", "book_appointment"];
 
+// ========================================================
+// 🛡️ نظام الطوارئ الذكي (Fallback System)
+// أسماء الموديلات لازم تكون مطابقة تماماً لأسماء Groq الرسمية، وإلا هيفشل النداء بـ 400 على طول
+// ========================================================
+const FALLBACK_MODELS = [
+    "meta-llama/llama-4-scout-17b-16e-instruct", // 1. الخيار الأساسي (سريع وبيدعم الصور لو احتجنا)
+    "qwen/qwen3.6-27b",                          // 2. البديل الأول (قوي وممتاز في النصوص)
+    "llama-3.3-70b-versatile",                   // 3. البديل الثاني (موديل تقيل ومستقر جداً)
+    "llama-3.1-8b-instant"                       // 4. خط الدفاع الأخير (خفيف وسريع جداً للطوارئ)
+];
+
 // محرك إدارة الحوار وتشغيل الدوال (Groq Engine)
 async function processMessage(userText, userPhone) {
+    // 1. تهيئة الذاكرة للمريض
     if (!sessions[userPhone]) {
         sessions[userPhone] = [
             { role: "system", content: SYSTEM_PROMPT }
@@ -26,6 +39,7 @@ async function processMessage(userText, userPhone) {
 
     const chatHistory = sessions[userPhone];
 
+    // 2. إدارة حجم الذاكرة (Sliding Window) عشان نوفر توكنز
     if (chatHistory.length > 20) {
         const systemInstruction = chatHistory[0];
         const recentHistory = chatHistory.slice(-6);
@@ -35,53 +49,58 @@ async function processMessage(userText, userPhone) {
     const userMessageWithPhone = `[رقم المريض: ${userPhone}] رسالة المريض: ${userText}`;
     chatHistory.push({ role: "user", content: userMessageWithPhone });
 
-    let response;
-    try {
-        response = await groq.chat.completions.create({
-            model: "llama-3.3-70b-versatile",
-            messages: chatHistory,
-            tools: tools,
-            tool_choice: "auto",
-            temperature: 0 // بيقلل التخبيط في استخراج الأسماء/الأيام كمعاملات للدوال
-        });
-    } catch (error) {
-        if (error.status === 429) {
-            console.warn("⚠️ الموديل الأساسي وصل للحد اليومي، بنجرب موديل بديل أخف...");
-            try {
-                // llama-3.1-8b-instant له حصة يومية مختلفة عن 70b، فبيفضل شغال لو التوكنز بتاعة الموديل التاني خلصت
-                response = await groq.chat.completions.create({
-                    model: "llama-3.1-8b-instant",
-                    messages: chatHistory,
-                    tools: tools,
-                    tool_choice: "auto",
-                    temperature: 0
-                });
-            } catch (fallbackError) {
-                // لو الموديلين وصلوا للحد، بنرجع رسالة واضحة للمريض بدل ما يفضل مستني رد ومايجيله حاجة
-                chatHistory.pop(); // نشيل رسالة المريض اللي مش هتترد عشان منزحمش الذاكرة برسالة من غير رد
-                return "عذراً، النظام مشغول جداً حالياً بسبب عدد الرسائل الكبير. من فضلك حاول تاني بعد كذا دقيقة 🙏";
-            }
-        } else {
-            throw error; // أي خطأ تاني (شبكة، إلخ) يفضل يترمي عادي عشان نلاحظه في اللوج
+    let response = null;
+    let lastError = null;
+
+    // بنلف على الموديلات بالترتيب لحد ما واحد ينجح
+    for (const modelName of FALLBACK_MODELS) {
+        try {
+            console.log(`🚀 جاري محاولة معالجة الرسالة باستخدام الموديل: ${modelName}...`);
+
+            response = await groq.chat.completions.create({
+                model: modelName,
+                messages: chatHistory,
+                tools: tools,
+                tool_choice: "auto",
+                temperature: 0 // بيقلل التخبيط في استخراج الأسماء/الأيام كمعاملات للدوال
+            });
+
+            console.log(`✅ نجح الموديل ${modelName} في الرد!`);
+            break; // كسر اللوب (مفيش داعي نجرب الباقي)
+
+        } catch (error) {
+            console.warn(`⚠️ فشل الموديل ${modelName} (السبب: ${error.status || error.message}). جاري تجربة البديل...`);
+            lastError = error;
         }
+    }
+
+    // لو كل الموديلات فشلت تماماً
+    if (!response) {
+        console.error("❌ كل الموديلات المتاحة فشلت في الرد:", lastError);
+        chatHistory.pop(); // نشيل رسالة المريض اللي مش هتترد عشان منزحمش الذاكرة
+        return "عذراً، النظام مشغول جداً حالياً بسبب عدد الرسائل الكبير. من فضلك حاول تاني بعد كذا دقيقة 🙏";
     }
 
     const responseMessage = response.choices[0].message;
     chatHistory.push(responseMessage);
 
+    // 3. معالجة تشغيل الدوال (Tool Calls)
     if (responseMessage.tool_calls) {
         const replyParts = [];
 
         for (const toolCall of responseMessage.tool_calls) {
             const functionName = toolCall.function.name;
-            // بعض الأحيان الموديل بيبعت الـ arguments كـ "null" (سترينج) لما الدالة مش محتاجة معاملات
-            // فبنتأكد إنها Object فاضي مش null قبل ما نحاول نفكها (destructure)
+
+            // التأكد إن المعاملات سليمة ومش Null
             const parsedArgs = JSON.parse(toolCall.function.arguments || "{}");
             const functionArgs = parsedArgs || {};
 
             console.log(`🤖 الـ AI يطلب تشغيل الدالة: ${functionName}`, functionArgs);
 
-            const apiResponse = await functions[functionName](functionArgs);
+            const targetFunction = functions[functionName];
+            const apiResponse = targetFunction
+                ? await targetFunction(functionArgs)
+                : "عذراً، حدث خطأ داخلي (دالة غير معروفة).";
 
             chatHistory.push({
                 tool_call_id: toolCall.id,
@@ -90,8 +109,7 @@ async function processMessage(userText, userPhone) {
                 content: apiResponse
             });
 
-            // بنبني الرد مباشرة من نتيجة الدالة الحقيقية (نص جاهز ومنسق)
-            // من غير ما نعتمد على الـ AI يعيد كتابتها تاني (فيه خطر يسهو عن بيانات أو يغيّر تفاصيل)
+            // بناء الرد مباشرة للمستخدم
             let part = apiResponse;
             if (!ACTION_FUNCTIONS.includes(functionName) && INFO_FOLLOWUPS[functionName] && !isNegativeResult(apiResponse)) {
                 part += `\n\n${INFO_FOLLOWUPS[functionName]}`;
@@ -101,7 +119,7 @@ async function processMessage(userText, userPhone) {
 
         const finalReply = replyParts.join("\n\n---\n\n");
 
-        // بنحفظ الرد النهائي في ذاكرة المريض
+        // حفظ الرد النهائي في ذاكرة المريض
         chatHistory.push({ role: "assistant", content: finalReply });
         return finalReply;
     }

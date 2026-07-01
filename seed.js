@@ -1,13 +1,5 @@
-const { initializeApp, cert } = require('firebase-admin/app');
-const { getFirestore } = require('firebase-admin/firestore');
-const serviceAccount = require('./firebase-key.json');
+const db = require('./config/firebase');
 const { MEDICINE_DATABASE, DOCTOR_DATABASE } = require('./data/seedData');
-
-initializeApp({
-  credential: cert(serviceAccount)
-});
-
-const db = getFirestore();
 
 async function uploadData() {
     console.log("⏳ جاري رفع البيانات إلى Firestore...");
@@ -20,7 +12,6 @@ async function uploadData() {
 
         console.log("-----------------------------------");
 
-        // 🚀 التعديل هنا: بنرفع الـ data كاملة (التخصص + المواعيد)
         for (const [name, data] of Object.entries(DOCTOR_DATABASE)) {
             await db.collection('doctors').doc(name).set(data);
             console.log(`✅ تم رفع بيانات دكتور: ${name} (تخصص ${data.specialty})`);

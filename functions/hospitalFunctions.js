@@ -1,6 +1,22 @@
 const db = require('../config/firebase');
 const findMedicineDoc = require('../services/medicineService');
-const { normalizeDay } = require('../utils/helpers');
+const { normalizeDay, formatArabicDate, getArabicWeekday } = require('../utils/helpers');
+
+// بيدور على الميعاد المطلوب وسط قائمة مواعيد الدكتور (ISO strings)، بيقارن بالنص الخام أو بالصيغة العربية المعروضة للمريض
+function findAppointmentIndex(availableTimes, appointmentTimeText) {
+    const target = appointmentTimeText.trim();
+    return availableTimes.findIndex(t => {
+        const displayed = formatArabicDate(t);
+        return (
+            t.trim() === target ||
+            displayed === target ||
+            displayed.includes(target) ||
+            target.includes(displayed) ||
+            target.includes(t) ||
+            t.includes(target)
+        );
+    });
+}
 
 // الدوال الفعلية التي ستتحدث مع Firestore، وبيناديها الـ AI حسب حاجة المريض
 const functions = {
@@ -24,7 +40,11 @@ const functions = {
         if (!doc.exists) return `لم نجد طبيب باسم ${cleanName}.`;
 
         const data = doc.data();
-        return `المواعيد المتاحة للدكتور ${cleanName} هي: ${data.appointments.join('، ')}.`;
+        if (!data.appointments || data.appointments.length === 0) {
+            return `عذراً، لا يوجد مواعيد متاحة حالياً لدكتور ${cleanName}.`;
+        }
+        const displayTimes = data.appointments.map(t => formatArabicDate(t));
+        return `المواعيد المتاحة للدكتور ${cleanName} هي: ${displayTimes.join('، ')}.`;
     },
 
     list_all_doctors: async ({ day } = {}) => {
@@ -39,13 +59,15 @@ const functions = {
             const data = doc.data();
             if (data.appointments && data.appointments.length > 0) {
                 if (normalizedDay) {
-                    const dayAppointments = data.appointments.filter(app => app.includes(normalizedDay));
+                    const dayAppointments = data.appointments.filter(t => normalizeDay(getArabicWeekday(t)) === normalizedDay);
                     if (dayAppointments.length > 0) {
-                        doctorsWithSchedules += `- دكتور ${doc.id}: مواعيده هي (${dayAppointments.join('، ')})\n`;
+                        const displayTimes = dayAppointments.map(t => formatArabicDate(t));
+                        doctorsWithSchedules += `- دكتور ${doc.id}${data.specialty ? ` (${data.specialty})` : ''}: مواعيده هي (${displayTimes.join('، ')})\n`;
                         hasAvailableDoctors = true;
                     }
                 } else {
-                    doctorsWithSchedules += `- دكتور ${doc.id}: مواعيده هي (${data.appointments.join('، ')})\n`;
+                    const displayTimes = data.appointments.map(t => formatArabicDate(t));
+                    doctorsWithSchedules += `- دكتور ${doc.id}${data.specialty ? ` (${data.specialty})` : ''}: مواعيده هي (${displayTimes.join('، ')})\n`;
                     hasAvailableDoctors = true;
                 }
             }
@@ -87,14 +109,11 @@ const functions = {
         const doctorData = doc.data();
         let availableTimes = doctorData.appointments || [];
 
-        const timeIndex = availableTimes.findIndex(t =>
-            t.trim() === appointment_time.trim() ||
-            appointment_time.includes(t) ||
-            t.includes(appointment_time)
-        );
+        const timeIndex = findAppointmentIndex(availableTimes, appointment_time);
 
         if (timeIndex === -1) {
-            return `عذراً، هذا الموعد (${appointment_time}) تم حجزه مسبقاً أو غير متاح. المواعيد المتاحة حالياً هي: ${availableTimes.join('، ')}.`;
+            const displayTimes = availableTimes.map(t => formatArabicDate(t));
+            return `عذراً، هذا الموعد (${appointment_time}) تم حجزه مسبقاً أو غير متاح. المواعيد المتاحة حالياً هي: ${displayTimes.join('، ')}.`;
         }
 
         const exactTime = availableTimes[timeIndex];
@@ -110,7 +129,7 @@ const functions = {
         };
 
         await db.collection('reservations').add(reservation);
-        return `تم تأكيد حجز موعد مع دكتور ${cleanName} في موعد (${exactTime}) بنجاح وتم حذف الميعاد من قائمة المتاح.`;
+        return `تم تأكيد حجز موعد مع دكتور ${cleanName} في موعد (${formatArabicDate(exactTime)}) بنجاح وتم حذف الميعاد من قائمة المتاح.`;
     }
 };
 

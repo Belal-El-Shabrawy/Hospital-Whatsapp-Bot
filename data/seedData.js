@@ -17,10 +17,9 @@ const MEDICINE_DATABASE = {
     "voltaren": { stock: 22, price: "30 EGP" }
 };
 
-// 👨‍⚕️👩‍⚕️ داتا الأطباء الموسعة
+// 👨‍⚕️👩‍⚕️ داتا الأطباء الموسعة (تخصص + مواعيد بصيغة ISO: YYYY-MM-DDTHH:mm:ss)
 const DOCTOR_DATABASE = {
-    // التواريخ مكتوبة بصيغة: YYYY-MM-DDTHH:mm:ss
-    "أحمد": { specialty: "عيون", appointments: ["2026-07-05T18:00:00", "2026-07-07T20:00:00"] }, 
+    "أحمد": { specialty: "عيون", appointments: ["2026-07-05T18:00:00", "2026-07-07T20:00:00"] },
     "عمر": { specialty: "باطنة", appointments: ["2026-07-06T16:00:00", "2026-07-08T13:00:00"] },
     "سارة": { specialty: "أنف وأذن", appointments: ["2026-07-02T10:00:00", "2026-07-04T14:00:00"] },
     "محمود": { specialty: "عظام", appointments: ["2026-07-05T12:00:00", "2026-07-07T16:00:00", "2026-07-09T20:00:00"] },
@@ -32,5 +31,4 @@ const DOCTOR_DATABASE = {
     "علي": { specialty: "أنف وأذن", appointments: ["2026-07-05T09:00:00", "2026-07-08T09:00:00"] }
 };
 
-// ... (نفس داتا الأدوية زي ما هي)
 module.exports = { MEDICINE_DATABASE, DOCTOR_DATABASE };

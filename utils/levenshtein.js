@@ -1,4 +1,5 @@
 // بيحسب "مسافة التحرير" بين كلمتين (عدد التغييرات اللازمة عشان توصل من كلمة لتانية)
+// بيمسك الأخطاء المطبعية القريبة زي cometrix/cometric لـ comtrex
 function levenshtein(a, b) {
     const m = a.length, n = b.length;
     const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
