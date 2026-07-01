@@ -5,9 +5,7 @@ const bodyParser = require('body-parser');
 // 1. الاستدعاء بالطريقة الحديثة لـ Firebase Admin
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
-const serviceAccount = require('./serviceAccountKey.json');
-
-// الاتصال بـ Firebase
+const serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
 initializeApp({
     credential: cert(serviceAccount)
 });
