@@ -23,6 +23,8 @@ router.get('/webhook', (req, res) => {
 router.post('/webhook', async (req, res) => {
     let body = req.body;
 
+    console.log("📥 [RADAR] استلام داتا من ميتا:", JSON.stringify(body, null, 2));
+
     if (body.object && body.entry && body.entry[0].changes && body.entry[0].changes[0].value.messages && body.entry[0].changes[0].value.messages[0]) {
         let message = body.entry[0].changes[0].value.messages[0];
         let from = message.from;
