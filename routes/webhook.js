@@ -3,8 +3,7 @@ const router = express.Router();
 const { formatArabicDate } = require('../utils/helpers');
 const db = require('../config/firebase'); // استدعاء قاعدة البيانات
 const processMessage = require('../services/aiEngine');
-const { sendWhatsAppMessage, sendInteractiveButtons, sendInteractiveList } = require('../services/whatsapp');
-
+const { sendWhatsAppMessage, sendInteractiveButtons, sendInteractiveList, downloadWhatsAppImage } = require('../services/whatsapp');
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "my_super_secret_token_123";
 
 router.get('/webhook', (req, res) => {
@@ -71,6 +70,84 @@ router.post('/webhook', async (req, res) => {
                     await sendInteractiveList(from, "الرجاء اختيار التخصص المطلوب:", "اختر التخصص", [
                         { title: "التخصصات المتاحة", rows: rows }
                     ]);
+                }
+                // ==========================================
+                // 3. لو المريض بعت صورة (روشتة أو كارنيه تأمين)
+                // ==========================================
+                else if (message.type === 'image') {
+                    let imageId = message.image.id;
+                    let mimeType = message.image.mime_type || "image/jpeg";
+                    console.log(`📸 استلام ميديا من ${from}، جاري المعالجة...`);
+                    
+                    await sendWhatsAppMessage(from, "⏳ جاري قراءة الصورة وفحص البيانات، لحظات من فضلك...");
+
+                    // 1. تحميل جزيئات الصورة من سيرفرات ميتا كـ Buffer
+                    const imageBuffer = await downloadWhatsAppImage(imageId);
+
+                    if (!imageBuffer) {
+                        await sendWhatsAppMessage(from, "❌ عذراً، فشل تحميل الصورة من سيرفرات واتساب. يرجى إعادة إرسالها.");
+                        return res.sendStatus(200);
+                    }
+
+                    // 2. تشغيل الـ OCR Engine (Gemini Vision) تلقائياً
+                    const { analyzeHospitalImage } = require('../services/visionEngine');
+                    const findMedicineDoc = require('../services/medicineService'); // استدعاء دالة البحث بتاعتك
+                    
+                    const analysis = await analyzeHospitalImage(imageBuffer, mimeType);
+                    console.log("🧠 نتيجة تحليل الذكاء الاصطناعي للصورة:", analysis);
+
+                    if (!analysis) {
+                        await sendWhatsAppMessage(from, "❌ عذراً، واجهنا صعوبة في قراءة تفاصيل الصورة. تأكد أن الإضاءة جيدة والخط واضح.");
+                        return res.sendStatus(200);
+                    }
+
+                    // ---- الحالة الأولى: المريض بعت روشتة أدوية ----
+                    if (analysis.type === 'prescription') {
+                        if (!analysis.medicines || analysis.medicines.length === 0) {
+                            await sendWhatsAppMessage(from, "📝 تم فحص الروشتة بنجاح، ولكن لم نتمكن من قراءة أي أسماء أدوية واضحة فيها.");
+                            return res.sendStatus(200);
+                        }
+
+                        let replyMessage = "📝 **نتائج فحص الروشتة الذكي:**\nإليك الأدوية المقروءة وحالة توفرها في الصيدلية لدينا:\n\n";
+                        
+                        // بنلف على الأدوية المستخرجة دواء دواء ونكشف في الفايربيز
+                        for (const medName of analysis.medicines) {
+                            const { doc } = await findMedicineDoc(medName);
+                            
+                            if (doc && doc.exists) {
+                                const data = doc.data();
+                                if (data.stock > 0) {
+                                    replyMessage += `✅ **${doc.id.toUpperCase()}**: متوفر بالمخزن. (السعر: ${data.price})\n`;
+                                } else {
+                                    replyMessage += `❌ **${doc.id.toUpperCase()}**: مسجل لدينا ولكنه (غير متوفر حالياً 🚫).\n`;
+                                }
+                            } else {
+                                replyMessage += `❓ **${medName}**: هذا الدواء غير مسجل في قائمة المستشفى.\n`;
+                            }
+                        }
+
+                        replyMessage += "\n💊 تحب تحجز الأدوية المتوفرة حالياً وتستلمها من مقر الصيدلية؟";
+                        await sendWhatsAppMessage(from, replyMessage);
+                    } 
+                    
+                    // ---- الحالة الثانية: المريض بعت كارنيه تأمين صحي ----
+                    else if (analysis.type === 'insurance') {
+                        let cardNum = analysis.card_number || "غير واضح";
+                        let company = analysis.company || "غير معروفة";
+                        let pName = analysis.patient_name || "غير واضح";
+
+                        // هنا تقدر مستقبلاً تربطه بجدول التأمين أو تشغل Puppeteer بتاعك
+                        let insuranceReply = `💳 **تم قراءة كارنيه التأمين الصحي بنجاح:**\n\n` +
+                                            `👤 **الاسم:** ${pName}\n` +
+                                            `🏢 **الشركة:** ${company}\n` +
+                                            `🔢 **رقم البطاقة:** ${cardNum}\n` +
+                                            `📅 **تاريخ الانتهاء:** ${analysis.expiry || 'غير مدون'}\n\n` +
+                                            `⏳ جاري مراجعة حالة التغطية مع الشركة أوتوماتيكياً وتفعيل الخصم على حسابك...`;
+                        
+                        await sendWhatsAppMessage(from, insuranceReply);
+                    } else {
+                        await sendWhatsAppMessage(from, "❓ الصورة التي أرسلتها غير مدرجة ضمن الروشتات أو بطاقات التأمين المعترف بها لدينا.");
+                    }
                 }
 
                 // --- عرض حجوزات المريض ---

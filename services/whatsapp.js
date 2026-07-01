@@ -66,4 +66,33 @@ async function sendInteractiveList(toPhone, textBody, buttonText, sectionsArray)
     } catch (error) { console.error("❌ خطأ داخلي:", error); }
 }
 
-module.exports = { sendWhatsAppMessage, sendInteractiveButtons, sendInteractiveList };
+// ضيف الدالة دي في ملف whatsapp.js
+async function downloadWhatsAppImage(imageId) {
+    try {
+        // 1. نجيب رابط الصورة من ميتا باستخدام الـ ID
+        const urlResponse = await fetch(`https://graph.facebook.com/v25.0/${imageId}`, {
+            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }
+        });
+        const urlData = await urlResponse.json();
+        
+        if (!urlData.url) {
+            throw new Error("لم يتم العثور على رابط الصورة");
+        }
+
+        // 2. نحمل الصورة نفسها كـ Buffer (بيانات خام)
+        const imageResponse = await fetch(urlData.url, {
+            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }
+        });
+        
+        const arrayBuffer = await imageResponse.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer); // ده اللي هنبعته للـ AI
+        
+        return buffer;
+    } catch (error) {
+        console.error("❌ خطأ في تحميل الصورة من ميتا:", error);
+        return null;
+    }
+}
+
+// متنساش تعملها تصدير في آخر الملف
+module.exports = { sendWhatsAppMessage, sendInteractiveButtons, sendInteractiveList, downloadWhatsAppImage };
