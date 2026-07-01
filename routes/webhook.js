@@ -1,14 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const { formatArabicDate } = require('../utils/helpers');
-const db = require('../config/firebase'); // استدعاء قاعدة البيانات مباشرة هنا
+const db = require('../config/firebase'); // استدعاء قاعدة البيانات
 const processMessage = require('../services/aiEngine');
 const { sendWhatsAppMessage, sendInteractiveButtons, sendInteractiveList } = require('../services/whatsapp');
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "my_super_secret_token_123";
 
 router.get('/webhook', (req, res) => {
-    // كود التحقق زي ما هو
     let mode = req.query['hub.mode'];
     let token = req.query['hub.verify_token'];
     let challenge = req.query['hub.challenge'];
@@ -28,17 +27,27 @@ router.post('/webhook', async (req, res) => {
 
         try {
             // ==========================================
-            // 1. لو المريض بعت نص عادي (بداية المحادثة)
+            // 1. لو المريض بعت نص عادي
             // ==========================================
             if (message.type === 'text') {
-                console.log(`📩 رسالة نصية من ${from}: ${message.text.body}`);
+                let msgBody = message.text.body;
+                console.log(`📩 رسالة نصية من ${from}: ${msgBody}`);
                 
-                // نبعتله القائمة الرئيسية فوراً
-            await sendInteractiveButtons(from, "مرحباً بك في المستشفى 🏥\nكيف يمكننا مساعدتك اليوم؟", [
-                { id: "FLOW_BOOK_DOCTOR", title: "👨‍⚕️ حجز طبيب" },
-                { id: "FLOW_PHARMACY", title: "💊 صيدلية المستشفى" },
-                { id: "FLOW_MY_APPOINTMENTS", title: "📅 مواعيدي / إلغاء" }
-            ]);
+                // لو الكلمة ترحيب نبعت الأزرار، لو اسم دواء نبعته للـ AI
+                const greetings = ['اهلا', 'أهلا', 'مرحبا', 'مرحباً', 'سلام', 'السلام', 'hi', 'hello', 'القائمة', 'menu'];
+                const isGreeting = greetings.some(g => msgBody.toLowerCase().includes(g)) || msgBody.length <= 2;
+                
+                if (isGreeting) {
+                    await sendInteractiveButtons(from, "مرحباً بك في المستشفى 🏥\nكيف يمكننا مساعدتك اليوم؟", [
+                        { id: "FLOW_BOOK_DOCTOR", title: "👨‍⚕️ حجز طبيب" },
+                        { id: "FLOW_PHARMACY", title: "💊 صيدلية المستشفى" },
+                        { id: "FLOW_MY_APPOINTMENTS", title: "📅 مواعيدي / إلغاء" }
+                    ]);
+                } else {
+                    const aiReply = await processMessage(msgBody, from);
+                    console.log(`✅ رد الـ AI: ${aiReply}`);
+                    await sendWhatsAppMessage(from, aiReply);
+                }
             } 
             
             // ==========================================
@@ -46,11 +55,10 @@ router.post('/webhook', async (req, res) => {
             // ==========================================
             else if (message.type === 'interactive') {
                 let interactive = message.interactive;
-                // تحديد الـ ID بناءً على هل هو زرار ولا عنصر من قائمة
                 let actionId = interactive.type === 'button_reply' ? interactive.button_reply.id : interactive.list_reply.id;
                 console.log(`🔘 المريض اختار: ${actionId}`);
 
-                // --- مسار حجز الطبيب ---
+                // --- مسار حجز الطبيب (بداية الفلترة) ---
                 if (actionId === 'FLOW_BOOK_DOCTOR') {
                     const docs = await db.collection('doctors').get();
                     let specialties = new Set();
@@ -64,9 +72,9 @@ router.post('/webhook', async (req, res) => {
                         { title: "التخصصات المتاحة", rows: rows }
                     ]);
                 }
-                // --- مسار عرض حجوزات المريض ---
+
+                // --- عرض حجوزات المريض ---
                 else if (actionId === 'FLOW_MY_APPOINTMENTS') {
-                    // هندور في الداتابيز على حجوزات الرقم ده اللي لسه confirmed
                     const snapshot = await db.collection('reservations')
                         .where('patient_phone', '==', from)
                         .where('status', '==', 'confirmed')
@@ -78,11 +86,12 @@ router.post('/webhook', async (req, res) => {
                         let rows = [];
                         snapshot.forEach(doc => {
                             let data = doc.data();
-                            // هنخلي الـ ID شايل رقم الـ Document بتاع الحجز عشان نوصله بسهولة
+                            let displayTime = data.time.includes('T') ? formatArabicDate(data.time) : data.time;
+                            
                             rows.push({ 
                                 id: `CANCEL_${doc.id}_${data.doctor}_${data.time}`, 
-                                title: `إلغاء: ${data.doctor}`, 
-                                description: `الموعد: ${data.time}` 
+                                title: `إلغاء: د. ${data.doctor}`, 
+                                description: `الموعد: ${displayTime}`.substring(0, 70) 
                             });
                         });
 
@@ -92,113 +101,194 @@ router.post('/webhook', async (req, res) => {
                     }
                 }
 
-                // --- مسار تنفيذ الإلغاء ---
+                // --- مسار تنفيذ الإلغاء (وسياسة الـ 24 ساعة) ---
                 else if (actionId.startsWith('CANCEL_')) {
-                    // الـ ID شكله: CANCEL_ReservationID_DoctorName_Time
                     let parts = actionId.split('_');
                     let reservationId = parts[1];
                     let doctorName = parts[2];
-                    let time = parts.slice(3).join('_'); // عشان لو الوقت فيه مسافات
+                    let timeISO = parts.slice(3).join('_'); 
 
                     try {
-                        // 1. تحديث حالة الحجز في الداتابيز لإلغاء
+                        if (timeISO.includes('T')) {
+                            const appointmentDate = new Date(timeISO);
+                            const now = new Date();
+                            const diffInHours = (appointmentDate - now) / (1000 * 60 * 60);
+
+                            if (diffInHours < 24) {
+                                let displayTime = formatArabicDate(timeISO);
+                                await sendWhatsAppMessage(from, `⚠️ عذراً، سياسة المستشفى تمنع إلغاء الموعد قبلها بأقل من 24 ساعة.\n\nموعدك مع د. ${doctorName} (${displayTime}) متبقي عليه أقل من يوم، يرجى التواصل هاتفياً.`);
+                                return;
+                            }
+                        }
+
+                        // تحديث حالة الحجز
                         await db.collection('reservations').doc(reservationId).update({
                             status: "cancelled",
                             cancelled_at: new Date()
                         });
 
-                        // 2. إرجاع الميعاد لقائمة الدكتور عشان مريض تاني يقدر يحجزه
+                        // إرجاع الميعاد
                         const docRef = db.collection('doctors').doc(doctorName);
                         const docSnap = await docRef.get();
                         
                         if (docSnap.exists) {
                             let appointments = docSnap.data().appointments || [];
-                            // نتأكد إن الميعاد مش موجود أصلاً قبل ما نضيفه
-                            if (!appointments.includes(time)) {
-                                appointments.push(time);
-                                // ممكن نرتب المواعيد لو حابب، بس حالياً مجرد إضافته تكفي
+                            if (!appointments.includes(timeISO)) {
+                                appointments.push(timeISO);
+                                appointments.sort((a, b) => new Date(a) - new Date(b));
                                 await docRef.update({ appointments: appointments });
                             }
                         }
 
-                        await sendWhatsAppMessage(from, `✅ تم إلغاء حجزك مع د. ${doctorName} في موعد (${time}) بنجاح.\nنتمنى لك دوام الصحة!`);
+                        let displayTime = timeISO.includes('T') ? formatArabicDate(timeISO) : timeISO;
+                        await sendWhatsAppMessage(from, `✅ تم إلغاء حجزك مع د. ${doctorName} في موعد (${displayTime}) بنجاح.\nنتمنى لك دوام الصحة!`);
                     } catch (error) {
                         console.error("❌ خطأ في إلغاء الحجز:", error);
                         await sendWhatsAppMessage(from, "عذراً، حدث خطأ أثناء إلغاء الحجز. يرجى المحاولة لاحقاً.");
                     }
                 }
                 
-                // --- اختيار التخصص (عرض الأطباء) ---
+                // ==========================================
+                // 1. اختيار التخصص (وعرض الأيام المتاحة)
+                // ==========================================
                 else if (actionId.startsWith('SPEC_')) {
                     let selectedSpec = actionId.replace('SPEC_', '');
                     const docs = await db.collection('doctors').where('specialty', '==', selectedSpec).get();
                     
-                    let rows = [];
+                    let availableDays = new Set();
+                    let dayMap = {}; 
+                    
                     docs.forEach(d => {
                         let data = d.data();
                         if (data.appointments && data.appointments.length > 0) {
-                            rows.push({ id: `DOC_${d.id}`, title: `د. ${d.id}`, description: "متاح للحجز" });
+                            data.appointments.forEach(timeISO => {
+                                let dateKey = timeISO.split('T')[0]; // "2026-07-05"
+                                availableDays.add(dateKey);
+                                
+                                if (!dayMap[dateKey]) {
+                                    dayMap[dateKey] = formatArabicDate(timeISO).split('،')[0]; // "الأحد 5 يوليو"
+                                }
+                            });
+                        }
+                    });
+
+                    if (availableDays.size > 0) {
+                        let sortedDays = Array.from(availableDays).sort((a, b) => new Date(a) - new Date(b));
+                        let rows = sortedDays.map(dateKey => ({
+                            id: `DAY_${selectedSpec}_${dateKey}`, 
+                            title: dayMap[dateKey].substring(0, 24)
+                        }));
+
+                        await sendInteractiveList(from, `الأيام المتاحة لتخصص (${selectedSpec}):`, "اختر اليوم", [
+                            { title: "الأيام المتاحة", rows: rows }
+                        ]);
+                    } else {
+                        await sendWhatsAppMessage(from, `عذراً، لا يوجد مواعيد متاحة في تخصص ${selectedSpec} حالياً.`);
+                    }
+                }
+
+                // ==========================================
+                // 2. اختيار اليوم (وعرض الأطباء المتاحين فيه)
+                // ==========================================
+                else if (actionId.startsWith('DAY_')) {
+                    let parts = actionId.split('_');
+                    let selectedSpec = parts[1];
+                    let selectedDate = parts[2];
+
+                    const docs = await db.collection('doctors').where('specialty', '==', selectedSpec).get();
+                    let rows = [];
+
+                    docs.forEach(d => {
+                        let data = d.data();
+                        if (data.appointments) {
+                            let hasApptOnDate = data.appointments.some(timeISO => timeISO.startsWith(selectedDate));
+                            if (hasApptOnDate) {
+                                rows.push({ 
+                                    id: `DOC_${d.id}_${selectedDate}`, 
+                                    title: `د. ${d.id}`, 
+                                    description: "متاح في هذا اليوم" 
+                                });
+                            }
                         }
                     });
 
                     if (rows.length > 0) {
-                        await sendInteractiveList(from, `أطباء تخصص (${selectedSpec}) المتاحين:`, "اختر الطبيب", [
+                        let displayDate = formatArabicDate(`${selectedDate}T12:00:00`).split('،')[0];
+                        await sendInteractiveList(from, `أطباء (${selectedSpec}) المتاحين يوم ${displayDate}:`, "اختر الطبيب", [
                             { title: "قائمة الأطباء", rows: rows }
                         ]);
                     } else {
-                        await sendWhatsAppMessage(from, `عذراً، لا يوجد أطباء متاحين في تخصص ${selectedSpec} حالياً.`);
+                        await sendWhatsAppMessage(from, `عذراً، لا يوجد أطباء متاحين في هذا اليوم.`);
                     }
                 }
-                
+
+                // ==========================================
+                // 3. اختيار الطبيب (وعرض الساعات المتاحة)
+                // ==========================================
                 else if (actionId.startsWith('DOC_')) {
-                    let doctorName = actionId.replace('DOC_', '');
+                    let parts = actionId.split('_');
+                    let doctorName = parts[1];
+                    let selectedDate = parts[2];
+
                     const docSnap = await db.collection('doctors').doc(doctorName).get();
                     let data = docSnap.data();
                     
-                    let rows = data.appointments.map(timeISO => {
-                        let displayTime = formatArabicDate(timeISO); // تحويل التاريخ لعربي للمريض
+                    let dayAppointments = data.appointments.filter(timeISO => timeISO.startsWith(selectedDate));
+                    
+                    let rows = dayAppointments.map(timeISO => {
+                        let fullArabicDate = formatArabicDate(timeISO);
+                        let displayTime = fullArabicDate.split('،').pop().trim(); // "6 م"
+
                         return {
-                            id: `BOOK_${doctorName}_${timeISO}`, // بنحفظ التاريخ الأصلي في الـ ID
-                            title: displayTime.substring(0, 24) // ميتا بترفض أي Title أطول من 24 حرف
+                            id: `BOOK_${doctorName}_${timeISO}`,
+                            title: `الساعة: ${displayTime}`.substring(0, 24)
                         };
                     });
 
                     if (rows.length > 0) {
-                        await sendInteractiveList(from, `المواعيد المتاحة لدكتور ${doctorName}:`, "اختر الموعد", [
-                            { title: "المواعيد المتاحة", rows: rows }
+                        await sendInteractiveList(from, `المواعيد المتاحة لدكتور ${doctorName}:`, "اختر الساعة", [
+                            { title: "الساعات المتاحة", rows: rows }
                         ]);
                     } else {
-                        await sendWhatsAppMessage(from, `عذراً، لا يوجد مواعيد متاحة حالياً لدكتور ${doctorName}.`);
+                        await sendWhatsAppMessage(from, `عذراً، لا يوجد مواعيد متاحة حالياً لدكتور ${doctorName} في هذا اليوم.`);
                     }
                 }
-                
+
+                // ==========================================
+                // 4. تأكيد الحجز (التنفيذ الفعلي)
+                // ==========================================
                 else if (actionId.startsWith('BOOK_')) {
                     let parts = actionId.split('_');
                     let doctorName = parts[1];
-                    let time = parts.slice(2).join('_'); // عشان لو الميعاد جواه مسافات
+                    let timeISO = parts.slice(2).join('_'); 
 
                     const docRef = db.collection('doctors').doc(doctorName);
                     const docSnap = await docRef.get();
                     let appointments = docSnap.data().appointments;
-                    const timeIndex = appointments.indexOf(time);
+                    const timeIndex = appointments.indexOf(timeISO);
 
                     if (timeIndex > -1) {
-                        // حذف الميعاد من الداتابيز
+                        // حذف الميعاد
                         appointments.splice(timeIndex, 1);
                         await docRef.update({ appointments: appointments });
 
                         // تسجيل الحجز
                         await db.collection('reservations').add({
-                            doctor: doctorName, time: time, patient_phone: from, status: "confirmed", created_at: new Date()
+                            doctor: doctorName, 
+                            time: timeISO, 
+                            patient_phone: from, 
+                            status: "confirmed", 
+                            created_at: new Date()
                         });
 
-                        await sendWhatsAppMessage(from, `✅ تم تأكيد حجزك بنجاح!\n👨‍⚕️ د. ${doctorName}\n🕒 الموعد: ${time}\nنتمنى لك دوام الصحة.`);
+                        let displayTime = formatArabicDate(timeISO);
+                        await sendWhatsAppMessage(from, `✅ تم تأكيد حجزك بنجاح!\n👨‍⚕️ د. ${doctorName}\n🕒 الموعد: ${displayTime}\nنتمنى لك دوام الصحة.`);
                     } else {
                         await sendWhatsAppMessage(from, `❌ عذراً، هذا الموعد تم حجزه منذ قليل. يرجى اختيار موعد آخر.`);
                     }
                 }
 
-                // --- مسار الصيدلية (يُرسل لـ Groq AI) ---
+                // --- مسار الصيدلية ---
                 else if (actionId === 'FLOW_PHARMACY') {
                     await sendWhatsAppMessage(from, "مرحباً بك في الصيدلية 💊. أرسل اسم الدواء الذي تبحث عنه وسأقوم بفحص توفره فوراً.");
                 }
