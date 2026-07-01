@@ -3,6 +3,7 @@ const router = express.Router();
 const { formatArabicDate } = require('../utils/helpers');
 const db = require('../config/firebase'); // استدعاء قاعدة البيانات
 const processMessage = require('../services/aiEngine');
+const { analyzeHospitalImage } = require('../services/visionEngine');
 const { sendWhatsAppMessage, sendInteractiveButtons, sendInteractiveList, downloadWhatsAppImage } = require('../services/whatsapp');
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "my_super_secret_token_123";
 
