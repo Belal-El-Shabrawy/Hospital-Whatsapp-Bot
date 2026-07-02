@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const { formatArabicDate } = require('../utils/helpers');
 const db = require('../config/firebase');
 const processMessage = require('../services/aiEngine');
@@ -8,7 +9,28 @@ const findMedicineDoc = require('../services/medicineService');
 const { sendWhatsAppMessage, sendInteractiveButtons, sendInteractiveList, downloadWhatsAppImage } = require('../services/whatsapp');
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "my_super_secret_token_123";
+// رقم واتساب الصيدلي المسؤول عن مراجعة طلبات الروشتات قبل التأكيد النهائي (خطوة "Pharmacist confirmation" في الفلو)
 const PHARMACIST_PHONE_NUMBER = process.env.PHARMACIST_PHONE_NUMBER || null;
+// App Secret بتاع تطبيق ميتا (Meta App Dashboard -> Settings -> Basic -> App Secret) — بيُستخدم للتحقق من توقيع الويب هوك
+const APP_SECRET = process.env.WHATSAPP_APP_SECRET || null;
+
+function isValidSignature(req) {
+    if (!APP_SECRET) {
+        console.warn("⚠️ WHATSAPP_APP_SECRET غير مُعرّف في .env — الويب هوك شغال من غير تحقق من التوقيع (غير آمن، ظبطه أسرع وقت ممكن).");
+        return true; // بنسمح بالمرور مؤقتاً عشان منكسرش البوت الشغال، لكن التحذير بيفضل يظهر في اللوج لحد ما يتظبط
+    }
+
+    const signatureHeader = req.headers['x-hub-signature-256'];
+    if (!signatureHeader || !req.rawBody) return false;
+
+    const expectedSignature = 'sha256=' + crypto.createHmac('sha256', APP_SECRET).update(req.rawBody).digest('hex');
+
+    try {
+        return crypto.timingSafeEqual(Buffer.from(signatureHeader), Buffer.from(expectedSignature));
+    } catch {
+        return false; // لو أطوال الـ buffers مختلفة (توقيع مزيّف واضح)، timingSafeEqual بترمي error بدل ما ترجع false
+    }
+}
 
 router.get('/webhook', (req, res) => {
     let mode = req.query['hub.mode'];
@@ -22,6 +44,11 @@ router.get('/webhook', (req, res) => {
 });
 
 router.post('/webhook', async (req, res) => {
+    if (!isValidSignature(req)) {
+        console.warn("🚫 توقيع الويب هوك غير صالح — تم رفض الطلب (محاولة تزييف محتملة).");
+        return res.sendStatus(403);
+    }
+
     let body = req.body;
 
     if (body.object && body.entry && body.entry[0].changes && body.entry[0].changes[0].value.messages && body.entry[0].changes[0].value.messages[0]) {
@@ -207,21 +234,28 @@ router.post('/webhook', async (req, res) => {
                     }
                 }
 
+                // 🔧 بقى بيستخدم Firestore Transaction بدل قراءة appointments وكتابتها في خطوتين منفصلتين
+                // (نفس سبب التعديل في book_appointment جوه hospitalFunctions.js — منع حجز نفس الميعاد مرتين)
                 else if (actionId.startsWith('BOOK_')) {
                     let parts = actionId.split('_');
                     let doctorName = parts[1];
                     let timeISO = parts.slice(2).join('_');
 
                     const docRef = db.collection('doctors').doc(doctorName);
-                    const docSnap = await docRef.get();
-                    let appointments = docSnap.data().appointments;
-                    const timeIndex = appointments.indexOf(timeISO);
 
-                    if (timeIndex > -1) {
+                    const result = await db.runTransaction(async (transaction) => {
+                        const docSnap = await transaction.get(docRef);
+                        if (!docSnap.exists) return { booked: false };
+
+                        let appointments = docSnap.data().appointments || [];
+                        const timeIndex = appointments.indexOf(timeISO);
+                        if (timeIndex === -1) return { booked: false };
+
                         appointments.splice(timeIndex, 1);
-                        await docRef.update({ appointments: appointments });
+                        transaction.update(docRef, { appointments });
 
-                        await db.collection('reservations').add({
+                        const reservationRef = db.collection('reservations').doc();
+                        transaction.set(reservationRef, {
                             doctor: doctorName,
                             time: timeISO,
                             patient_phone: from,
@@ -229,6 +263,10 @@ router.post('/webhook', async (req, res) => {
                             created_at: new Date()
                         });
 
+                        return { booked: true };
+                    });
+
+                    if (result.booked) {
                         let displayTime = formatArabicDate(timeISO);
                         await sendWhatsAppMessage(from, `✅ تم تأكيد حجزك بنجاح!\n👨‍⚕️ د. ${doctorName}\n🕒 الموعد: ${displayTime}\nنتمنى لك دوام الصحة.`);
                     } else {
@@ -291,22 +329,28 @@ router.post('/webhook', async (req, res) => {
                             }
                         }
 
-                        await db.collection('reservations').doc(reservationId).update({
-                            status: "cancelled",
-                            cancelled_at: new Date()
-                        });
-
+                        // 🔧 تحديث حالة الحجز + رجوع الميعاد لقائمة الدكتور بقوا في Transaction واحدة
+                        // (منع تضارب لو حد لغى حجزين لنفس الدكتور في نفس اللحظة بالظبط)
+                        const reservationRef = db.collection('reservations').doc(reservationId);
                         const docRef = db.collection('doctors').doc(doctorName);
-                        const docSnap = await docRef.get();
 
-                        if (docSnap.exists) {
-                            let appointments = docSnap.data().appointments || [];
-                            if (!appointments.includes(timeISO)) {
-                                appointments.push(timeISO);
-                                appointments.sort((a, b) => new Date(a) - new Date(b));
-                                await docRef.update({ appointments: appointments });
+                        await db.runTransaction(async (transaction) => {
+                            const docSnap = await transaction.get(docRef);
+
+                            transaction.update(reservationRef, {
+                                status: "cancelled",
+                                cancelled_at: new Date()
+                            });
+
+                            if (docSnap.exists) {
+                                let appointments = docSnap.data().appointments || [];
+                                if (!appointments.includes(timeISO)) {
+                                    appointments.push(timeISO);
+                                    appointments.sort((a, b) => new Date(a) - new Date(b));
+                                    transaction.update(docRef, { appointments });
+                                }
                             }
-                        }
+                        });
 
                         let displayTime = timeISO.includes('T') ? formatArabicDate(timeISO) : timeISO;
                         await sendWhatsAppMessage(from, `✅ تم إلغاء حجزك مع د. ${doctorName} في موعد (${displayTime}) بنجاح.\nنتمنى لك دوام الصحة!`);
@@ -331,25 +375,42 @@ router.post('/webhook', async (req, res) => {
 
                     const orderId = actionId.replace('CONFIRM_ORDER_', '');
                     const orderRef = db.collection('prescription_orders').doc(orderId);
-                    const orderSnap = await orderRef.get();
 
-                    if (!orderSnap.exists || orderSnap.data().status !== 'pending_pharmacist_review') {
+                    // 🔧 التحقق من حالة الطلب + إنزال المخزون + تحديث حالة الطلب، كل ده بقى في Transaction واحدة.
+                    // ده بيمنع حالتين: (1) الصيدلي يدوس "تأكيد" مرتين بسرعة فينزل المخزون مرتين،
+                    // (2) مريضين مختلفين طلباتهم بتشترك في نفس الدواء ويتنزل المخزون غلط لو حصل تزامن.
+                    let order;
+                    try {
+                        order = await db.runTransaction(async (transaction) => {
+                            const orderSnap = await transaction.get(orderRef);
+                            if (!orderSnap.exists || orderSnap.data().status !== 'pending_pharmacist_review') {
+                                return null;
+                            }
+
+                            const orderData = orderSnap.data();
+                            const medRefs = orderData.items.map(item => db.collection('medicines').doc(item.id));
+                            const medSnaps = medRefs.length > 0 ? await transaction.getAll(...medRefs) : [];
+
+                            medSnaps.forEach((medSnap, i) => {
+                                if (medSnap.exists && medSnap.data().stock > 0) {
+                                    transaction.update(medRefs[i], { stock: medSnap.data().stock - 1 });
+                                }
+                            });
+
+                            transaction.update(orderRef, { status: 'confirmed', confirmed_at: new Date() });
+                            return orderData;
+                        });
+                    } catch (error) {
+                        console.error("❌ خطأ أثناء تأكيد الطلب (transaction):", error);
+                        await sendWhatsAppMessage(from, "❌ حدث خطأ فني أثناء تأكيد الطلب. حاول مرة أخرى.");
+                        return res.sendStatus(200);
+                    }
+
+                    if (!order) {
                         await sendWhatsAppMessage(from, "⚠️ هذا الطلب تمت معالجته بالفعل أو غير موجود.");
                         return res.sendStatus(200);
                     }
 
-                    const order = orderSnap.data();
-
-                    // بننزل المخزون فعلياً بس دلوقتي (بعد تأكيد بشري)، مش وقت الحجز الأولي من المريض
-                    for (const item of order.items) {
-                        const medRef = db.collection('medicines').doc(item.id);
-                        const medSnap = await medRef.get();
-                        if (medSnap.exists && medSnap.data().stock > 0) {
-                            await medRef.update({ stock: medSnap.data().stock - 1 });
-                        }
-                    }
-
-                    await orderRef.update({ status: 'confirmed', confirmed_at: new Date() });
                     await sendWhatsAppMessage(from, "✅ تم تأكيد الطلب بنجاح.");
                     await sendWhatsAppMessage(order.patient_phone, "✅ تم تأكيد طلبك من الصيدلي! تقدر تستلم أدويتك من مقر الصيدلية دلوقتي. نتمنى لك دوام الصحة 🌿");
                 }
@@ -362,15 +423,21 @@ router.post('/webhook', async (req, res) => {
 
                     const orderId = actionId.replace('REJECT_ORDER_', '');
                     const orderRef = db.collection('prescription_orders').doc(orderId);
-                    const orderSnap = await orderRef.get();
 
-                    if (!orderSnap.exists || orderSnap.data().status !== 'pending_pharmacist_review') {
+                    const order = await db.runTransaction(async (transaction) => {
+                        const orderSnap = await transaction.get(orderRef);
+                        if (!orderSnap.exists || orderSnap.data().status !== 'pending_pharmacist_review') {
+                            return null;
+                        }
+                        transaction.update(orderRef, { status: 'rejected', rejected_at: new Date() });
+                        return orderSnap.data();
+                    });
+
+                    if (!order) {
                         await sendWhatsAppMessage(from, "⚠️ هذا الطلب تمت معالجته بالفعل أو غير موجود.");
                         return res.sendStatus(200);
                     }
 
-                    const order = orderSnap.data();
-                    await orderRef.update({ status: 'rejected', rejected_at: new Date() });
                     await sendWhatsAppMessage(from, "تم رفض الطلب ❌");
                     await sendWhatsAppMessage(order.patient_phone, "❌ عذراً، لم يتم تأكيد طلبك من الصيدلي. يرجى التواصل مع الصيدلية مباشرة للتفاصيل.");
                 }

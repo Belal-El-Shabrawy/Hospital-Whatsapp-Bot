@@ -80,56 +80,84 @@ const functions = {
         return doctorsWithSchedules;
     },
 
+    // 🔧 بقى بيستخدم Firestore Transaction بدل قراءة الكمية وكتابتها في خطوتين منفصلتين.
+    // من غير ده، لو مريضين طلبوا آخر علبة في نفس اللحظة، ممكن الاتنين ياخدوا "تم الحجز بنجاح" (Race Condition).
     book_medicine: async ({ medicine_name, quantity } = {}) => {
         if (!medicine_name) return "عايز اسم الدواء عشان أقدر أحجزه.";
-        const { docRef, doc } = await findMedicineDoc(medicine_name);
+        const { docRef } = await findMedicineDoc(medicine_name);
 
-        if (!doc) return "عذراً، هذا الدواء غير متوفر في المستشفى.";
+        if (!docRef) return "عذراً، هذا الدواء غير متوفر في المستشفى.";
 
-        const item = doc.data();
         const reqQty = quantity || 1;
 
-        if (item.stock >= reqQty) {
-            await docRef.update({ stock: item.stock - reqQty });
-            return `تم حجز عدد ${reqQty} من دواء ${doc.id} بنجاح. رصيد المخزن المتبقي: ${item.stock - reqQty}.`;
-        } else {
-            return `عذراً، الكمية المطلوبة غير متوفرة. المتاح في المخزن حالياً هو ${item.stock} علبة فقط.`;
+        try {
+            const result = await db.runTransaction(async (transaction) => {
+                const freshDoc = await transaction.get(docRef);
+                if (!freshDoc.exists) return { success: false, notFound: true };
+
+                const item = freshDoc.data();
+                if (item.stock < reqQty) {
+                    return { success: false, available: item.stock };
+                }
+
+                transaction.update(docRef, { stock: item.stock - reqQty });
+                return { success: true, remaining: item.stock - reqQty, name: freshDoc.id };
+            });
+
+            if (result.notFound) return "عذراً، هذا الدواء غير متوفر في المستشفى.";
+            if (!result.success) return `عذراً، الكمية المطلوبة غير متوفرة. المتاح في المخزن حالياً هو ${result.available} علبة فقط.`;
+            return `تم حجز عدد ${reqQty} من دواء ${result.name} بنجاح. رصيد المخزن المتبقي: ${result.remaining}.`;
+        } catch (error) {
+            console.error("❌ خطأ أثناء حجز الدواء (transaction):", error);
+            return "عذراً، حدث خطأ فني أثناء محاولة الحجز. برجاء المحاولة مرة أخرى.";
         }
     },
 
+    // 🔧 بقى بيستخدم Firestore Transaction عشان يمنع حجز نفس الميعاد مرتين لو مريضين ضغطوا في نفس اللحظة بالظبط.
     book_appointment: async ({ doctor_name, appointment_time, patient_phone } = {}) => {
         if (!doctor_name || !appointment_time) return "محتاج اسم الدكتور والميعاد المطلوب عشان أقدر أأكد الحجز.";
         let cleanName = doctor_name.replace(/الدكتورة|الدكتور|دكتورة|دكتور|د\./g, '').trim();
-
         const doctorRef = db.collection('doctors').doc(cleanName);
-        const doc = await doctorRef.get();
 
-        if (!doc.exists) return `عذراً، لم نجد طبيب باسم ${cleanName}.`;
+        try {
+            const result = await db.runTransaction(async (transaction) => {
+                const doc = await transaction.get(doctorRef);
+                if (!doc.exists) return { status: 'not_found' };
 
-        const doctorData = doc.data();
-        let availableTimes = doctorData.appointments || [];
+                const doctorData = doc.data();
+                let availableTimes = doctorData.appointments || [];
+                const timeIndex = findAppointmentIndex(availableTimes, appointment_time);
 
-        const timeIndex = findAppointmentIndex(availableTimes, appointment_time);
+                if (timeIndex === -1) {
+                    return { status: 'unavailable', availableTimes };
+                }
 
-        if (timeIndex === -1) {
-            const displayTimes = availableTimes.map(t => formatArabicDate(t));
-            return `عذراً، هذا الموعد (${appointment_time}) تم حجزه مسبقاً أو غير متاح. المواعيد المتاحة حالياً هي: ${displayTimes.join('، ')}.`;
+                const exactTime = availableTimes[timeIndex];
+                availableTimes.splice(timeIndex, 1);
+                transaction.update(doctorRef, { appointments: availableTimes });
+
+                const reservationRef = db.collection('reservations').doc();
+                transaction.set(reservationRef, {
+                    doctor: cleanName,
+                    time: exactTime,
+                    patient_phone: patient_phone,
+                    status: "confirmed",
+                    created_at: new Date()
+                });
+
+                return { status: 'booked', exactTime };
+            });
+
+            if (result.status === 'not_found') return `عذراً، لم نجد طبيب باسم ${cleanName}.`;
+            if (result.status === 'unavailable') {
+                const displayTimes = result.availableTimes.map(t => formatArabicDate(t));
+                return `عذراً، هذا الموعد (${appointment_time}) تم حجزه مسبقاً أو غير متاح. المواعيد المتاحة حالياً هي: ${displayTimes.join('، ')}.`;
+            }
+            return `تم تأكيد حجز موعد مع دكتور ${cleanName} في موعد (${formatArabicDate(result.exactTime)}) بنجاح وتم حذف الميعاد من قائمة المتاح.`;
+        } catch (error) {
+            console.error("❌ خطأ أثناء حجز الموعد (transaction):", error);
+            return "عذراً، حدث خطأ فني أثناء محاولة الحجز. برجاء المحاولة مرة أخرى.";
         }
-
-        const exactTime = availableTimes[timeIndex];
-        availableTimes.splice(timeIndex, 1);
-        await doctorRef.update({ appointments: availableTimes });
-
-        const reservation = {
-            doctor: cleanName,
-            time: exactTime,
-            patient_phone: patient_phone,
-            status: "confirmed",
-            created_at: new Date()
-        };
-
-        await db.collection('reservations').add(reservation);
-        return `تم تأكيد حجز موعد مع دكتور ${cleanName} في موعد (${formatArabicDate(exactTime)}) بنجاح وتم حذف الميعاد من قائمة المتاح.`;
     }
 };
 
