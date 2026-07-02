@@ -32,6 +32,24 @@ function isValidSignature(req) {
     }
 }
 
+// 🆕 القائمة الرئيسية (نفس أزرار رسالة الترحيب) — بنعيد استخدامها بعد ما المريض يضغط "نعم" في سؤال المتابعة
+async function sendMainMenu(to, introText = "تمام 🏥 كيف يمكننا مساعدتك؟") {
+    await sendInteractiveButtons(to, introText, [
+        { id: "FLOW_BOOK_DOCTOR", title: "👨‍⚕️ حجز طبيب" },
+        { id: "FLOW_PHARMACY", title: "💊 صيدلية المستشفى" },
+        { id: "FLOW_MY_APPOINTMENTS", title: "📅 مواعيدي / إلغاء" }
+    ]);
+}
+
+// 🆕 بعد أي إجراء "نهائي" (تأكيد حجز، إلغاء، رد الـ AI، نتيجة فحص صورة... إلخ)
+// بنسأل المريض لو محتاج حاجة تانية، بدل ما نسيبه من غير أي تفاعل بعدها
+async function askForMoreHelp(to) {
+    await sendInteractiveButtons(to, "هل تحتاج مساعدة في أي شيء آخر؟ 🙋", [
+        { id: "FOLLOWUP_YES", title: "نعم، القائمة الرئيسية" },
+        { id: "FOLLOWUP_NO", title: "لا، شكراً 🙏" }
+    ]);
+}
+
 router.get('/webhook', (req, res) => {
     let mode = req.query['hub.mode'];
     let token = req.query['hub.verify_token'];
@@ -67,15 +85,13 @@ router.post('/webhook', async (req, res) => {
                 const isGreeting = greetings.some(g => msgBody.toLowerCase().includes(g)) || msgBody.length <= 2;
 
                 if (isGreeting) {
-                    await sendInteractiveButtons(from, "مرحباً بك في المستشفى 🏥\nكيف يمكننا مساعدتك اليوم؟", [
-                        { id: "FLOW_BOOK_DOCTOR", title: "👨‍⚕️ حجز طبيب" },
-                        { id: "FLOW_PHARMACY", title: "💊 صيدلية المستشفى" },
-                        { id: "FLOW_MY_APPOINTMENTS", title: "📅 مواعيدي / إلغاء" }
-                    ]);
+                    await sendMainMenu(from, "مرحباً بك في المستشفى 🏥\nكيف يمكننا مساعدتك اليوم؟");
                 } else {
                     const aiReply = await processMessage(msgBody, from);
                     console.log(`✅ رد الـ AI: ${aiReply}`);
                     await sendWhatsAppMessage(from, aiReply);
+                    // 🆕 رد الـ AI ده بيكون آخر حاجة في الفلو النصي، فبنسأل المريض لو محتاج حاجة تانية
+                    await askForMoreHelp(from);
                 }
             }
 
@@ -87,7 +103,16 @@ router.post('/webhook', async (req, res) => {
                 let actionId = interactive.type === 'button_reply' ? interactive.button_reply.id : interactive.list_reply.id;
                 console.log(`🔘 المريض اختار: ${actionId}`);
 
-                if (actionId === 'FLOW_BOOK_DOCTOR') {
+                // 🆕 رد المريض على سؤال المتابعة ("محتاج حاجة تانية؟") بعد أي إجراء نهائي
+                if (actionId === 'FOLLOWUP_YES') {
+                    await sendMainMenu(from);
+                }
+
+                else if (actionId === 'FOLLOWUP_NO') {
+                    await sendWhatsAppMessage(from, "تسلم 🌿 إحنا موجودين لو احتجتنا في أي وقت. اعتنِ بنفسك!");
+                }
+
+                else if (actionId === 'FLOW_BOOK_DOCTOR') {
                     const docs = await db.collection('doctors').get();
                     let specialties = new Set();
                     docs.forEach(d => specialties.add(d.data().specialty));
@@ -134,6 +159,7 @@ router.post('/webhook', async (req, res) => {
                         ]);
                     } else {
                         await sendWhatsAppMessage(from, `عذراً، لا يوجد مواعيد متاحة في تخصص ${selectedSpec} حالياً.`);
+                        await askForMoreHelp(from);
                     }
                 }
 
@@ -166,6 +192,7 @@ router.post('/webhook', async (req, res) => {
                         ]);
                     } else {
                         await sendWhatsAppMessage(from, `عذراً، لا يوجد أطباء متاحين في هذا اليوم.`);
+                        await askForMoreHelp(from);
                     }
                 }
 
@@ -195,6 +222,7 @@ router.post('/webhook', async (req, res) => {
                         ]);
                     } else {
                         await sendWhatsAppMessage(from, `عذراً، لا يوجد مواعيد متاحة حالياً لدكتور ${doctorName} في هذا اليوم.`);
+                        await askForMoreHelp(from);
                     }
                 }
 
@@ -232,9 +260,10 @@ router.post('/webhook', async (req, res) => {
                     } else {
                         console.warn("⚠️ PHARMACIST_PHONE_NUMBER غير مُعرّف في .env — لن يتم إرسال الطلب لأي صيدلي للمراجعة.");
                     }
+                    await askForMoreHelp(from);
                 }
 
-                // 🔧 بقى بيستخدم Firestore Transaction بدل قراءة appointments وكتابتها في خطوتين منفصلتين
+                // 🔧 بيستخدم Firestore Transaction بدل قراءة appointments وكتابتها في خطوتين منفصلتين
                 // (نفس سبب التعديل في book_appointment جوه hospitalFunctions.js — منع حجز نفس الميعاد مرتين)
                 else if (actionId.startsWith('BOOK_')) {
                     let parts = actionId.split('_');
@@ -269,8 +298,10 @@ router.post('/webhook', async (req, res) => {
                     if (result.booked) {
                         let displayTime = formatArabicDate(timeISO);
                         await sendWhatsAppMessage(from, `✅ تم تأكيد حجزك بنجاح!\n👨‍⚕️ د. ${doctorName}\n🕒 الموعد: ${displayTime}\nنتمنى لك دوام الصحة.`);
+                        await askForMoreHelp(from);
                     } else {
                         await sendWhatsAppMessage(from, `❌ عذراً، هذا الموعد تم حجزه منذ قليل. يرجى اختيار موعد آخر.`);
+                        await askForMoreHelp(from);
                     }
                 }
 
@@ -282,6 +313,7 @@ router.post('/webhook', async (req, res) => {
 
                     if (snapshot.empty) {
                         await sendWhatsAppMessage(from, "ليس لديك أي حجوزات قادمة مسجلة برقمك حالياً.");
+                        await askForMoreHelp(from);
                     } else {
                         let rows = [];
                         snapshot.forEach(doc => {
@@ -308,6 +340,7 @@ router.post('/webhook', async (req, res) => {
                     const orderId = actionId.replace('CANCEL_ORDER_', '');
                     await db.collection('prescription_orders').doc(orderId).update({ status: 'cancelled_by_patient' });
                     await sendWhatsAppMessage(from, "تم الإلغاء. لو احتجت أي حاجة تانية أنا موجود 🙌");
+                    await askForMoreHelp(from);
                 }
 
                 else if (actionId.startsWith('CANCEL_')) {
@@ -325,6 +358,7 @@ router.post('/webhook', async (req, res) => {
                             if (diffInHours < 24) {
                                 let displayTime = formatArabicDate(timeISO);
                                 await sendWhatsAppMessage(from, `⚠️ عذراً، سياسة المستشفى تمنع إلغاء الموعد قبلها بأقل من 24 ساعة.\n\nموعدك مع د. ${doctorName} (${displayTime}) متبقي عليه أقل من يوم، يرجى التواصل هاتفياً.`);
+                                await askForMoreHelp(from);
                                 return res.sendStatus(200);
                             }
                         }
@@ -354,6 +388,7 @@ router.post('/webhook', async (req, res) => {
 
                         let displayTime = timeISO.includes('T') ? formatArabicDate(timeISO) : timeISO;
                         await sendWhatsAppMessage(from, `✅ تم إلغاء حجزك مع د. ${doctorName} في موعد (${displayTime}) بنجاح.\nنتمنى لك دوام الصحة!`);
+                        await askForMoreHelp(from);
                     } catch (error) {
                         console.error("❌ خطأ في إلغاء الحجز:", error);
                         await sendWhatsAppMessage(from, "عذراً، حدث خطأ أثناء إلغاء الحجز. يرجى المحاولة لاحقاً.");
@@ -471,6 +506,7 @@ router.post('/webhook', async (req, res) => {
                 if (analysis.type === 'prescription') {
                     if (!analysis.medicines || analysis.medicines.length === 0) {
                         await sendWhatsAppMessage(from, "📝 تم فحص الروشتة بنجاح، ولكن لم نتمكن من قراءة أي أسماء أدوية واضحة فيها.");
+                        await askForMoreHelp(from);
                         return res.sendStatus(200);
                     }
 
@@ -512,11 +548,15 @@ router.post('/webhook', async (req, res) => {
                             { id: `BOOK_ORDER_${orderRef.id}`, title: "📦 احجز الأدوية" },
                             { id: `CANCEL_ORDER_${orderRef.id}`, title: "❌ لا شكراً" }
                         ]);
+                    } else {
+                        // 🆕 كل الأدوية المقروءة إما غير مسجلة أو مخزونها صفر، فمفيش زرارين حجز — الفلو بيقف هنا
+                        await askForMoreHelp(from);
                     }
                 }
                 else if (analysis.type === 'insurance') {
                     let insuranceReply = `💳 **تم قراءة كارنيه التأمين بنجاح:**\n👤 الاسم: ${analysis.patient_name}\n🏢 الشركة: ${analysis.company}\n🔢 رقم: ${analysis.card_number}\n✅ تم تفعيل التغطية بنجاح!`;
                     await sendWhatsAppMessage(from, insuranceReply);
+                    await askForMoreHelp(from);
                 }
             }
 
